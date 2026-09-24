@@ -10,43 +10,50 @@ CachyOS GPU Squeezer - Видео конвертер с аппаратным у�
 Флаг VSQUIEZER_NO_CONSOLE защищает от бесконечного цикла перезапусков.
 """
 
-import sys  # используется в блоке авто-перезапуска ниже (os импортируется следом)
+import sys
+import os
 
 # ============================================================================
 # АБСОЛЮТНО ПЕРВЫЙ БЛОК: гарантированный старт БЕЗ КОНСОЛИ (только Windows)
 # ----------------------------------------------------------------------------
-# Если файл запускается двойным кликом через python.exe (или из cmd), то к
-# моменту импорта этого модуля консольное окно УЖЕ создано операционной
-# системой, и позже спрятать его нельзя. Поэтому перезапуск через
-# pythonw.exe выполняется здесь — до импорта PyQt и любых других модулей,
-# чтобы чёрное окно консоли не мелькало вообще.
-# Для собранного EXE (PyInstaller --noconsole / cx_Freeze BASE="Win32")
-# консоли нет по построению — код ниже его не создаёт и не трогает.
-# Флаг VSQUIEZER_NO_CONSOLE защищает от бесконечного цикла перезапусков.
+# ИСПРАВЛЕНО (по клику файл не запускался): предыдущая версия прятала консоль,
+# перезапуская скрипт через pythonw.exe с флагом DETACHED_PROCESS. Этот флаг
+# ЗАПРЕЩЁН при запуске GUI-интерпретатора pythonw.exe — CreateProcess возвращал
+# ошибку, приложение молча не стартовало. Теперь дочерний процесс запускается
+# БЕЗ DETACHED_PROCESS: pythonw.exe сам по себе не создаёт консольного окна.
+# Родительский процесс завершается сразу (os._exit), поэтому чёрное окно
+# консоли от двойного клика закрывается автоматически.
+# Флаг VSQUIEZER_NO_CONSOLE передаётся в окружении явной копией environ и
+# защищает дочерний процесс от повторного перезапуска (бесконечный цикл).
+# Если pythonw.exe недоступен — консоль спрячет сам скрипт (FreeConsole),
+# а вызовы ffmpeg/ffprobe и так идут с CREATE_NO_WINDOW (см. ниже).
+# Для собранного EXE (sys.frozen) блок пропускается — консоли нет по построению.
 # ============================================================================
 if sys.platform == "win32" and not getattr(sys, "frozen", False):
     try:
-        import os as _os
-        if _os.environ.get("VSQUIEZER_NO_CONSOLE") != "1":
-            _script = _os.path.abspath(__file__)
-            # .py -> .pyw: association launches the GUI interpreter directly
-            if _script.lower().endswith(".py"):
-                _pyw = _script[:-3] + ".pyw"
-                if _os.path.exists(_pyw):
-                    _os.environ["VSQUIEZER_NO_CONSOLE"] = "1"
-                    _os.execv(sys.executable, [sys.executable, _pyw] + sys.argv[1:])
-            _base = _os.path.basename(sys.executable).lower()
+        import subprocess as _sp
+        if os.environ.get("VSQUIEZER_NO_CONSOLE") != "1":
+            _script = os.path.abspath(__file__)
+            _child_env = dict(os.environ)
+            _child_env["VSQUIEZER_NO_CONSOLE"] = "1"
+            _base = os.path.basename(sys.executable).lower()
             if _base in ("python.exe", "python3.exe"):
-                _pythonw = _os.path.join(_os.path.dirname(sys.executable), "pythonw.exe")
-                if _os.path.exists(_pythonw):
-                    _os.environ["VSQUIEZER_NO_CONSOLE"] = "1"
-                    _os.execv(_pythonw, [_pythonw, _script] + sys.argv[1:])
+                _pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                if os.path.exists(_pythonw):
+                    # ВАЖНО: без DETACHED_PROCESS — он несовместим с pythonw.exe
+                    # (CreateProcess отказывает GUI-приложению с этим флагом).
+                    _sp.Popen([_pythonw, _script] + sys.argv[1:], env=_child_env)
+                    # Родительский процесс (тот, что был запущен двойным кликом)
+                    # завершается СРАЗУ — система закрывает его консольное окно,
+                    # а приложение продолжает работу в окне без консоли.
+                    os._exit(0)
+                # pythonw.exe отсутствует: НЕ перезапускаемся (иначе потеряем
+                # stdout/stderr); текущий процесс продолжит работу и сам
+                # скроет консоль через FreeConsole в начале main().
     except Exception:
         # Если перезапуск не удался — продолжаем работу в текущем процессе
         pass
 
-import os
-import sys
 import stat
 import shutil
 import zipfile
