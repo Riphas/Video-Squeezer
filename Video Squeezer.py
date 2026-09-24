@@ -3,7 +3,48 @@
 """
 CachyOS GPU Squeezer - Видео конвертер с аппаратным ускорением
 ИСПРАВЛЕННАЯ ВЕРСИЯ (без удаления готовых файлов + без задержек)
+
+Запуск БЕЗ КОНСОЛИ: файл перезапускается через pythonw.exe до импорта PyQt,
+а если консоль всё же осталась (например, pythonw недоступен), она
+гарантированно скрывается средствами Windows API (FreeConsole).
+Флаг VSQUIEZER_NO_CONSOLE защищает от бесконечного цикла перезапусков.
 """
+
+import sys  # используется в блоке авто-перезапуска ниже (os импортируется следом)
+
+# ============================================================================
+# АБСОЛЮТНО ПЕРВЫЙ БЛОК: гарантированный старт БЕЗ КОНСОЛИ (только Windows)
+# ----------------------------------------------------------------------------
+# Если файл запускается двойным кликом через python.exe (или из cmd), то к
+# моменту импорта этого модуля консольное окно УЖЕ создано операционной
+# системой, и позже спрятать его нельзя. Поэтому перезапуск через
+# pythonw.exe выполняется здесь — до импорта PyQt и любых других модулей,
+# чтобы чёрное окно консоли не мелькало вообще.
+# Для собранного EXE (PyInstaller --noconsole / cx_Freeze BASE="Win32")
+# консоли нет по построению — код ниже его не создаёт и не трогает.
+# Флаг VSQUIEZER_NO_CONSOLE защищает от бесконечного цикла перезапусков.
+# ============================================================================
+if sys.platform == "win32" and not getattr(sys, "frozen", False):
+    try:
+        import os as _os
+        if _os.environ.get("VSQUIEZER_NO_CONSOLE") != "1":
+            _script = _os.path.abspath(__file__)
+            # .py -> .pyw: association launches the GUI interpreter directly
+            if _script.lower().endswith(".py"):
+                _pyw = _script[:-3] + ".pyw"
+                if _os.path.exists(_pyw):
+                    _os.environ["VSQUIEZER_NO_CONSOLE"] = "1"
+                    _os.execv(sys.executable, [sys.executable, _pyw] + sys.argv[1:])
+            _base = _os.path.basename(sys.executable).lower()
+            if _base in ("python.exe", "python3.exe"):
+                _pythonw = _os.path.join(_os.path.dirname(sys.executable), "pythonw.exe")
+                if _os.path.exists(_pythonw):
+                    _os.environ["VSQUIEZER_NO_CONSOLE"] = "1"
+                    _os.execv(_pythonw, [_pythonw, _script] + sys.argv[1:])
+    except Exception:
+        # Если перезапуск не удался — продолжаем работу в текущем процессе
+        pass
+
 import os
 import sys
 import stat
@@ -1554,32 +1595,42 @@ def _apply_runtime_paths():
     logging.info(f"Обновлённые пути: FFMPEG_EXE={FFMPEG_EXE}, FFPROBE_EXE={FFPROBE_EXE}")
 
 
+def _hide_console_windows():
+    """Гарантированное скрытие консоли на Windows (если она всё ещё есть).
+
+    Вызывается как страховка в тех редких случаях, когда перезапуск через
+    pythonw.exe невозможен (например, в окружении нет pythonw.exe):
+    окно консоли прячется через ShowWindow(SW_HIDE), а затем процесс
+    отсоединяется от неё через FreeConsole.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            SW_HIDE = 0
+            user32.ShowWindow(hwnd, SW_HIDE)
+            kernel32.FreeConsole()
+    except Exception:
+        pass
+
+
 def main():
     """
     Старт приложения без консоли единым окном:
-    - .pyw / pythonw или PyInstaller (--windowed/--noconsole) консоль уже отсутствует;
-    - при запуске из обычной консоли на Windows процесс перезапускается через
-      pythonw detached-режимом, чтобы было только одно окно без чёрного окна.
-    Также при старте автоматически скачиваются недостающие компоненты (ffmpeg/ffprobe).
+    - консольное окно закрывается/прячется в самом начале файла (перезапуск
+      через pythonw.exe до импорта PyQt + гарантированное скрытие через
+      Windows API как страховка);
+    - для собранного EXE используется PyInstaller с флагом --noconsole
+      (--windowed), тогда чёрного окна нет по построению;
+    - при старте автоматически скачиваются недостающие компоненты
+      (ffmpeg/ffprobe).
     """
-    if sys.platform == "win32" and not getattr(sys, 'frozen', False) \
-            and not os.environ.get("SQUEEZER_NO_CONSOLE"):
-        try:
-            if sys.stdout is None or sys.stderr is None:
-                # Уже запущены через pythonw — консоли нет
-                os.environ["SQUEEZER_NO_CONSOLE"] = "1"
-            else:
-                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-                if os.path.exists(pythonw):
-                    os.environ["SQUEEZER_NO_CONSOLE"] = "1"
-                    DETACHED = 0x00000008 | 0x00000010  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                    subprocess.Popen([pythonw] + sys.argv, creationflags=DETACHED,
-                                     close_fds=True)
-                    sys.exit(0)
-        except SystemExit:
-            raise
-        except Exception as e:
-            logging.warning(f"Перезапуск без консоли не удался ({e}), продолжаем в текущем процессе.")
+    # Страховка: если по какой-то причине мы всё ещё запущены с консолью
+    # (pythonw.exe недоступен и т.п.) — скрываем её немедленно.
+    _hide_console_windows()
 
     app = QApplication(sys.argv)
 
