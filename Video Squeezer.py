@@ -826,6 +826,72 @@ class SqueezerCore(QObject):
         except (ValueError, TypeError):
             return 6500
 
+    def get_video_fps(self, path):
+        """Точный fps видео-потока (для покадровой точности обрезки)."""
+        cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=r_frame_rate",
+               "-of", "default=noprint_wrappers=1:nokey=1", path]
+        output = self._probe(path, "fps", cmd)
+        try:
+            num, den = output.strip().split("/")
+            fps = float(num) / float(den)
+            if fps <= 0 or fps > 1000:
+                raise ValueError
+            return fps
+        except (ValueError, TypeError, ZeroDivisionError):
+            return 25.0
+
+    def _frame_accurate_trimspec(self, data):
+        """
+        КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ТОЧНОСТИ ОБРЕЗКИ.
+        Возвращает строку вида "start_frame:end_frame" для фильтра trim —
+        обрезка идёт ПО НОМЕРАМ КАДРОВ, т.е. ровно по тому кадру, который
+        выбран ползунком, без «съезжания» на соседний кадр из-за округления.
+        """
+        fps = self.get_video_fps(data["path"])
+        start_f = int(round(max(0.0, data["start"]) * fps))
+        end_f = int(round(max(0.0, data["end"]) * fps))
+        if end_f <= start_f:
+            end_f = start_f + 1
+        return f"start_frame={start_f}:end_frame={end_f}"
+
+    def _copy_trim_is_frame_accurate(self, data):
+        """
+        True, если stream-copy с указанными границами начнётся РОВНО с
+        выбранного кадра (т.е. этот кадр является keyframe-ом). Иначе ffmpeg
+        при -c copy откатится назад/вперёд до ближайшего ключевой кадра и
+        начало ролика сдвинется — в этом случае возвращаем False, и программа
+        перекодирует ролик (перекодирование покадрово точное).
+        """
+        try:
+            fps = self.get_video_fps(data["path"])
+        except Exception:
+            return False
+        # кадры, между которыми ищем keyframe вокруг стартовой границы
+        start_f = int(round(max(0.0, data["start"]) * fps))
+        cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0",
+               "-skip_frame", "nokey",
+               "-show_entries", "frame=best_effort_timestamp_time",
+               "-of", "default=noprint_wrappers=1:nokey=1", data["path"]]
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL,
+                                          creationflags=CREATION_FLAGS,
+                                          timeout=30).decode()
+            key_times = [float(x) for x in out.split()]
+        except Exception as e:
+            logging.error(f"Не удалось получить keyframes для проверки точности copy: {e}")
+            return False
+        if not key_times:
+            return False
+        # первый keyframe на или после выбранного кадра
+        target_sec = start_f / fps
+        for kt in key_times:
+            if kt >= target_sec - (0.5 / max(fps, 1.0)):
+                # совпадает ли он ровно с выбранным кадром?
+                kf_frame = int(round(kt * fps))
+                return abs(kf_frame - start_f) <= 0
+        return False
+
     def calculate_bitrate(self, row, strict_limit, target_size_gb, global_val):
         if row not in self.app.queue_data:
             return None
@@ -944,15 +1010,22 @@ class SqueezerCore(QObject):
             self.app.current_output_file = out
             logging.info(f"Выходной файл: {out}")
 
-            # ИСПРАВЛЕНИЕ: если ролик с родным битрейтом уже в лимите —
-            # НЕ перекодировать вовсе: копируем виде/аудио потоки (stream copy),
-            # сохраняя оригинальное качество и размер.
-            if data.get("bitrate") is None:
+            # ИСПРАВЛЕНИЕ: если ролик с родным битрейтом уже в лимите и кроп/
+            # разрешение НЕ заданы — НЕ перекодировать вовсе: копируем потоки.
+            # ВАЖНО (точность обрезки): при -c copy отсечение возможно только
+            # по ключевым кадрам, поэтому перед копированием проверяем, что
+            # ближайший keyframe не «съедает» выбранный начальный кадр. Если
+            # съедает — молча переходим на перекодировку (она покадрово точна).
+            if data.get("bitrate") is None and not data.get("crop_area") \
+                    and (not data.get("target_res") or data["target_res"] == "Оригинал") \
+                    and self._copy_trim_is_frame_accurate(data):
                 args = [FFMPEG_EXE, "-y",
-                        "-ss", str(data["start"]), "-to", str(data["end"]),
+                        "-ss", f"{data['start']:.6f}",
+                        "-to", f"{data['end']:.6f}",
                         "-i", data["path"],
                         "-c", "copy", "-movflags", "+faststart", out]
-                logging.info("Битрейт не задан (в лимите) — копирование без перекодирования.")
+                logging.info("Битрейт не задан (в лимите) — копирование без перекодирования "
+                             "(границы совпадают с ключевыми кадрами).")
                 self.start_time = time.time()
                 try:
                     self.ffmpeg_proc = subprocess.Popen(args, stdout=subprocess.PIPE,
@@ -969,6 +1042,16 @@ class SqueezerCore(QObject):
                 return True
 
             vf_filters = []
+            # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ТОЧНОСТИ ОБРЕЗКИ ПРИ ПЕРЕКОДИРОВАНИИ:
+            # вместо "-ss/-to" (которые в разных версиях ffmpeg и при
+            # аппаратном ускорении могут откатываться до ближайшего keyframe)
+            # используем покадровый фильтр trim — он вырезает РОВНО кадры
+            # start_frame..end_frame, выбранные ползунком.
+            trimspec = self._frame_accurate_trimspec(data)
+            logging.info(f"Точная обрезка по кадрам: trim={trimspec} "
+                         f"(fps={self.get_video_fps(data['path'])})")
+            vf_filters.append(f"trim={trimspec}")
+            vf_filters.append("setpts=PTS-STARTPTS")
             if data.get("crop_area") and data["crop_area"] != " ":
                 vf_filters.append(f"crop={data['crop_area']}")
             if data.get("target_res") and data["target_res"] != "Оригинал":
@@ -986,8 +1069,10 @@ class SqueezerCore(QObject):
                 # ffmpeg собран БЕЗ nvenc — кодирование падало с ошибкой.
                 # Теперь проверяем наличие h264_nvenc в самом ffmpeg.
                 encoder = "h264_nvenc" if self._has_nvenc_encoder() else "libx264"
-                args.extend(["-hwaccel", "cuda", "-i", data["path"],
-                             "-ss", str(data["start"]), "-to", str(data["end"])])
+                # ВАЖНО: -ss/-to УБРАНЫ из аргументов — обрезку выполняет
+                # фильтр trim (по номерам кадров), иначе при hwaccel кадр
+                # старта мог съезжать до ближайшего keyframe.
+                args.extend(["-hwaccel", "cuda", "-i", data["path"]])
                 if vf_filters:
                     args.extend(["-vf", ", ".join(vf_filters)])
                 if encoder == "h264_nvenc":
@@ -1000,7 +1085,8 @@ class SqueezerCore(QObject):
                                  "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k",
                                  "-preset", "medium"])
             else:
-                args.extend(["-i", data["path"], "-ss", str(data["start"]), "-to", str(data["end"])])
+                # ВАЖНО: без -ss/-to — обрезка покадровая через фильтр trim
+                args.extend(["-i", data["path"]])
                 if vf_filters:
                     args.extend(["-vf", ", ".join(vf_filters)])
                 # maxrate и bufsize для контроля размера
@@ -1008,7 +1094,10 @@ class SqueezerCore(QObject):
                             "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k",
                             "-preset", "medium"])
 
-            args.extend(["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out])
+            # Обрезка аудио точно по тем же границам (видео режется фильтром
+            # trim, аудио — отдельными флагами, чтобы не было рассинхрона)
+            args.extend(["-ss", f"{data['start']:.6f}", "-to", f"{data['end']:.6f}",
+                         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out])
 
             logging.info(f"Запуск FFmpeg:")
             logging.info(f"  FFMPEG_EXE: {FFMPEG_EXE}")
