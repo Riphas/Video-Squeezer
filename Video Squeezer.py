@@ -3,9 +3,57 @@
 """
 CachyOS GPU Squeezer - Видео конвертер с аппаратным ускорением
 ИСПРАВЛЕННАЯ ВЕРСИЯ (без удаления готовых файлов + без задержек)
+
+Запуск БЕЗ КОНСОЛИ: файл перезапускается через pythonw.exe до импорта PyQt,
+а если консоль всё же осталась (например, pythonw недоступен), она
+гарантированно скрывается средствами Windows API (FreeConsole).
+Флаг VSQUIEZER_NO_CONSOLE защищает от бесконечного цикла перезапусков.
 """
-import os
+
 import sys
+import os
+
+# ============================================================================
+# АБСОЛЮТНО ПЕРВЫЙ БЛОК: гарантированный старт БЕЗ КОНСОЛИ (только Windows)
+# ----------------------------------------------------------------------------
+# ИСПРАВЛЕНО (по клику файл не запускался): предыдущая версия прятала консоль,
+# перезапуская скрипт через pythonw.exe с флагом DETACHED_PROCESS. Этот флаг
+# ЗАПРЕЩЁН при запуске GUI-интерпретатора pythonw.exe — CreateProcess возвращал
+# ошибку, приложение молча не стартовало. Теперь дочерний процесс запускается
+# БЕЗ DETACHED_PROCESS: pythonw.exe сам по себе не создаёт консольного окна.
+# Родительский процесс завершается сразу (os._exit), поэтому чёрное окно
+# консоли от двойного клика закрывается автоматически.
+# Флаг VSQUIEZER_NO_CONSOLE передаётся в окружении явной копией environ и
+# защищает дочерний процесс от повторного перезапуска (бесконечный цикл).
+# Если pythonw.exe недоступен — консоль спрячет сам скрипт (FreeConsole),
+# а вызовы ffmpeg/ffprobe и так идут с CREATE_NO_WINDOW (см. ниже).
+# Для собранного EXE (sys.frozen) блок пропускается — консоли нет по построению.
+# ============================================================================
+if sys.platform == "win32" and not getattr(sys, "frozen", False):
+    try:
+        import subprocess as _sp
+        if os.environ.get("VSQUIEZER_NO_CONSOLE") != "1":
+            _script = os.path.abspath(__file__)
+            _child_env = dict(os.environ)
+            _child_env["VSQUIEZER_NO_CONSOLE"] = "1"
+            _base = os.path.basename(sys.executable).lower()
+            if _base in ("python.exe", "python3.exe"):
+                _pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                if os.path.exists(_pythonw):
+                    # ВАЖНО: без DETACHED_PROCESS — он несовместим с pythonw.exe
+                    # (CreateProcess отказывает GUI-приложению с этим флагом).
+                    _sp.Popen([_pythonw, _script] + sys.argv[1:], env=_child_env)
+                    # Родительский процесс (тот, что был запущен двойным кликом)
+                    # завершается СРАЗУ — система закрывает его консольное окно,
+                    # а приложение продолжает работу в окне без консоли.
+                    os._exit(0)
+                # pythonw.exe отсутствует: НЕ перезапускаемся (иначе потеряем
+                # stdout/stderr); текущий процесс продолжит работу и сам
+                # скроет консоль через FreeConsole в начале main().
+    except Exception:
+        # Если перезапуск не удался — продолжаем работу в текущем процессе
+        pass
+
 import stat
 import shutil
 import zipfile
@@ -167,6 +215,15 @@ def ensure_components(progress_cb=None, status_cb=None):
     problems.append(f"Автоматическое скачивание не удалось: {last_err}. "
                     f"Установите ffmpeg вручную или положите ffmpeg/ffprobe рядом с программой.")
     return problems
+
+
+def _components_present():
+    """True, если ffmpeg/ffprobe лежат рядом с программой или есть в PATH."""
+    binaries = ("ffmpeg.exe", "ffprobe.exe") if sys.platform == "win32" else ("ffmpeg", "ffprobe")
+    if all(os.path.exists(os.path.join(EXE_DIR, b)) for b in binaries):
+        return True
+    return all(shutil.which(b.replace(".exe", "")) for b in binaries)
+
 
 def get_short_path(long_path):
     if sys.platform != "win32":
@@ -459,9 +516,19 @@ class SqueezerPlayer(QWidget):
             self._loader_thread.metadata_ready.connect(self._on_metadata_loaded)
             self._loader_thread.start()
 
-            self.media_player.setSource(QUrl.fromLocalFile(path))
-            self.media_player.play()
-            self.media_player.pause()
+            # setSource + play/pause выполнялись СИНХРОННО в потоке GUI:
+            # медиа-бэкенд Qt открывал файл прямо во время клика по строке,
+            # из-за чего на больших/медленных файлах интерфейс подвисал.
+            # Переносим «раскрутку» плеера на следующий цикл событий —
+            # окно остаётся отзывчивым, переключение строк не блокируется.
+            def _start_playback():
+                try:
+                    self.media_player.setSource(QUrl.fromLocalFile(path))
+                    self.media_player.play()
+                    self.media_player.pause()
+                except Exception as e:
+                    logging.error(f"Ошибка загрузки источника: {e}")
+            QTimer.singleShot(0, _start_playback)
 
             self.video_canvas.update()
         except Exception as e:
@@ -708,6 +775,33 @@ class CropDialog(QDialog):
 
 
 # ============================================================================
+# ФОНОВАЯ ПРОВЕРКА ТОЧНОСТИ COPY-ОБРЕЗКИ (keyframes)
+# ============================================================================
+class KeyframeCheckThread(QThread):
+    """
+    Проверяет в фоновом потоке, можно ли обрезать ролик копированием
+    потоков без потери выбранного начального кадра. Синхронный запуск
+    этой проверки вешал GUI и блокировал проводник Windows: ffprobe со
+    -skip_frame nokey читает гигабайты данных десятки секунд.
+    """
+    result_ready = pyqtSignal(int, bool)  # row, is_accurate
+
+    def __init__(self, core, row, data, parent=None):
+        super().__init__(parent)
+        self.core = core
+        self.row = row
+        self.data = dict(data)  # снимок — на случай изменения очереди
+
+    def run(self):
+        try:
+            accurate = self.core._copy_trim_is_frame_accurate(self.data)
+        except Exception as e:
+            logging.error(f"KeyframeCheckThread: {e}")
+            accurate = False
+        self.result_ready.emit(self.row, accurate)
+
+
+# ============================================================================
 # ЯДРО С КЕШИРОВАНИЕМ FFPROBE
 # ============================================================================
 class SqueezerCore(QObject):
@@ -721,6 +815,7 @@ class SqueezerCore(QObject):
         self.ffmpeg_proc = None
         self.start_time = 0.0
         self._probe_cache = {}
+        self._nvenc_cache = None  # есть ли h264_nvenc в текущем ffmpeg (кэш)
         # Флаг глобальной остановки: когда True — текущее видео прерывается,
         # а оставшаяся очередь помечается остановленной (останавливаются ВСЕ сразу)
         self.stop_requested = False
@@ -768,12 +863,102 @@ class SqueezerCore(QObject):
         except (ValueError, TypeError):
             return 6500
 
+    def get_video_fps(self, path):
+        """Точный fps видео-потока (для покадровой точности обрезки)."""
+        cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=r_frame_rate",
+               "-of", "default=noprint_wrappers=1:nokey=1", path]
+        output = self._probe(path, "fps", cmd)
+        try:
+            num, den = output.strip().split("/")
+            fps = float(num) / float(den)
+            if fps <= 0 or fps > 1000:
+                raise ValueError
+            return fps
+        except (ValueError, TypeError, ZeroDivisionError):
+            return 25.0
+
+    def _frame_accurate_trimspec(self, data):
+        """
+        КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ТОЧНОСТИ ОБРЕЗКИ.
+        Возвращает строку вида "start_frame:end_frame" для фильтра trim —
+        обрезка идёт ПО НОМЕРАМ КАДРОВ, т.е. ровно по тому кадру, который
+        выбран ползунком, без «съезжания» на соседний кадр из-за округления.
+        """
+        fps = self.get_video_fps(data["path"])
+        start_f = int(round(max(0.0, data["start"]) * fps))
+        end_f = int(round(max(0.0, data["end"]) * fps))
+        if end_f <= start_f:
+            end_f = start_f + 1
+        return f"start_frame={start_f}:end_frame={end_f}"
+
+    def _copy_trim_is_frame_accurate(self, data):
+        """
+        True, если stream-copy с указанными границами начнётся РОВНО с
+        выбранного кадра (т.е. этот кадр является keyframe-ом). Иначе ffmpeg
+        при -c copy откатится назад/вперёд до ближайшего ключевой кадра и
+        начало ролика сдвинется — в этом случае возвращаем False, и программа
+        перекодирует ролик (перекодирование покадрово точное).
+
+        ВАЖНО: проверка выполняется АСИНХРОННО (см. KeyframeCheckThread),
+        т.к. ffprobe со сканированием ключевых кадров может читать гигабайты
+        данных и занимать десятки секунд — синхронный вызов вешал GUI и
+        блокировал проводник Windows (общий кэш файлов). Результат кэшируется.
+        """
+        try:
+            fps = self.get_video_fps(data["path"])
+        except Exception:
+            return False
+        # кадры, между которыми ищем keyframe вокруг стартовой границы
+        start_f = int(round(max(0.0, data["start"]) * fps))
+        cache_key = (data["path"], start_f)
+        cached = self.app._keyframe_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0",
+               "-skip_frame", "nokey",
+               "-show_entries", "frame=best_effort_timestamp_time",
+               "-of", "default=noprint_wrappers=1:nokey=1", data["path"]]
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL,
+                                          creationflags=CREATION_FLAGS,
+                                          timeout=60).decode()
+            key_times = [float(x) for x in out.split()]
+        except Exception as e:
+            logging.error(f"Не удалось получить keyframes для проверки точности copy: {e}")
+            return False
+        # ИСПРАВЛЕНИЕ ТОЧНОСТИ ПРИ COPY: ffmpeg с -ss ДО -i ищет ближайший
+        # ключевой кадр НЕ ПОЗЖЕ указанной позиции (откат назад). Поэтому
+        # копирование начнётся ровно с выбранного кадра ТОЛЬКО если сам этот
+        # кадр является keyframe-ом. Раньше проверялся «первый keyframe на или
+        # после» — из-за чего copy мог стартануть раньше выбранного кадра.
+        result = False
+        if key_times:
+            target_sec = start_f / fps
+            half = 0.5 / max(fps, 1.0)
+            for kt in key_times:
+                if abs(kt - target_sec) <= half:
+                    result = (int(round(kt * fps)) == start_f)
+                    break
+        self.app._keyframe_cache[cache_key] = result
+        return result
+
     def calculate_bitrate(self, row, strict_limit, target_size_gb, global_val):
         if row not in self.app.queue_data:
             return None
         data = self.app.queue_data[row]
         duration = data["end"] - data["start"]
         if duration <= 0:
+            # ИСПРАВЛЕНИЕ «СБОЙ»: раньше при нулевой длительности функция
+            # молча возвращала None — битрейт оставался со значением по
+            # умолчанию, а ffmpeg падал на пустом фрагменте. Теперь это явная
+            # ошибка строки с понятным статусом в таблице.
+            logging.error(f"Строка {row}: нулевая длительность отрезка "
+                          f"(start={data['start']}, end={data['end']})")
+            try:
+                self.app.table.setItem(row, 4, QTableWidgetItem("✗ Пустой отрезок"))
+            except Exception:
+                pass
             return None
 
         # "Родной" битрейт источника (кб/с) — нужен для проверки лимита размера
@@ -784,14 +969,51 @@ class SqueezerCore(QObject):
         data["source_bitrate"] = source_bitrate
 
         if strict_limit:
-            # Запас 5%
-            safe_target_gb = max(0.05, target_size_gb * 0.95)
+            # ИСПРАВЛЕНИЕ: сравниваем с ПОЛНЫМ родным битрейтом файла (видео+аудио),
+            # т.к. лимит размера относится ко всему файлу. Раньше видео-битрейт
+            # сравнивался с общим битрейдом контейнера — из-за этого при близких
+            # значениях включалась перекодировка и файл раздувало до лимита.
+            try:
+                source_total_bitrate = int(self._probe(data["path"], "bitrate_total",
+                                                       [FFPROBE_EXE, "-v", "error", "-show_entries",
+                                                        "format=bit_rate",
+                                                        "-of", "default=noprint_wrappers=1:nokey=1",
+                                                        data["path"]]) / 1000)
+            except (ValueError, TypeError):
+                source_total_bitrate = 0
+            if source_total_bitrate <= 0:
+                # запасной вариант: видео + аудио
+                source_total_bitrate = source_bitrate + 128 if source_bitrate else 0
+
+            # Если ролик с РОДНЫМ битрейтом весит меньше целевого лимита —
+            # НЕ повышаем битрейт искусственно: оставляем родной.
+            # (Копирование без перекодирования применяется только когда не
+            # заданы кроп/изменение разрешения — иначе фильтр требует перекодировки.)
+            # ЕДИНИЦЫ: source_total_bitrate в кбит/с, duration в секундах ->
+            # размер в битах = kbit*1000*s; лимит в ГБ переводим в байты и *8.
+            limit_bits = target_size_gb * 0.95 * 1024 * 1024 * 1024 * 8
+            if source_total_bitrate > 0 and source_total_bitrate * 1000 * duration <= limit_bits:
+                crop_active = data.get("crop_area") and data["crop_area"].strip() not in ("", " ")
+                res_active = data.get("target_res") and data["target_res"] != "Оригинал"
+                if not crop_active and not res_active:
+                    return None, "__NOCODEC__"
+                video_bitrate = source_bitrate if source_bitrate > 0 else source_total_bitrate - 128
+                status_text = f"{video_bitrate} кб/с (родной, в лимите {target_size_gb} ГБ)"
+                return video_bitrate, status_text
+
+            # Ролик тяжелее лимита — считаем видеобитрейт под лимит
+            # (запас 5%). ВАЖНО: floor берём от ФАКТИЧЕСКОГО лимита, а не от
+            # значения с запасом — иначе на очень маленьких лимитах расчётный
+            # битрейт мог оказаться ВЫШЕ родного и файл раздувало обратно
+            # до границы лимита (искусственное завышение битрейта).
+            safe_target_gb = target_size_gb * 0.95
             target_bits = safe_target_gb * 1024 * 1024 * 1024 * 8
             # Правильный расчет: вычитаем аудио (128 кб/с)
             audio_bits_total = 128000 * duration
             video_bits_available = target_bits - audio_bits_total
             calculated_video_bitrate = int(video_bits_available / 1000 / duration)
-            calculated_video_bitrate = max(100, calculated_video_bitrate)
+            min_floor_bits = int(max(0.0, target_size_gb * 1024**3 * 8 - 128000 * duration) / 1000 / duration)
+            calculated_video_bitrate = max(1, min(100, min_floor_bits), calculated_video_bitrate)
 
             if source_bitrate > 0 and calculated_video_bitrate >= source_bitrate:
                 # ИСПРАВЛЕНИЕ: ролик с родным битрейтом весит МЕНЬШЕ лимита —
@@ -822,6 +1044,105 @@ class SqueezerCore(QObject):
         except Exception:
             return False
 
+    def _has_nvenc_encoder(self):
+        """Проверяет, что конкретный ffmpeg собран с h264_nvenc (кэшируется)."""
+        if self._nvenc_cache is not None:
+            return self._nvenc_cache
+        try:
+            out = subprocess.run([FFMPEG_EXE, "-hide_banner", "-encoders"],
+                                 capture_output=True, creationflags=CREATION_FLAGS, timeout=15)
+            text = (out.stdout + out.stderr).decode(errors="ignore")
+            self._nvenc_cache = "h264_nvenc" in text
+        except Exception:
+            self._nvenc_cache = False
+        return self._nvenc_cache
+
+    def _launch_copy(self, row, data, out):
+        """Запуск ffmpeg в режиме -c copy (быстрая переупаковка без перекодирования)."""
+        # ИСПРАВЛЕНИЕ «СБОЙ»: границы режем ПО КАДРАМ (как в trim-режиме),
+        # а не секундами с точностью до миллиметра. При -c copy ffmpeg оставляет
+        # кадры с PTS >= time(границы); из-за округления времени в float
+        # (секунды->кадры->секунды) выбранный кадр мог оказаться на наносекунду
+        # РАНЬШЕ границы и отбрасываться — начало ролика съезжало на кадр.
+        # Сдвиг границы на полкадра назад гарантирует попадание нужного кадра
+        # и не захватывает лишнего (предыдущий кадр минимум на 1/fps раньше).
+        fps = self.get_video_fps(data["path"])
+        start_f = int(round(max(0.0, data["start"]) * fps))
+        end_f = int(round(max(0.0, data["end"]) * fps))
+        if end_f <= start_f:
+            end_f = start_f + 1
+        half = 0.5 / max(fps, 1e-6)
+        ss_val = max(0.0, start_f / fps - half)
+        to_val = end_f / fps + half
+        args = [FFMPEG_EXE, "-y",
+                "-ss", f"{ss_val:.6f}",
+                "-to", f"{to_val:.6f}",
+                "-i", data["path"],
+                "-c", "copy", "-movflags", "+faststart", out]
+        logging.info("Битрейт не задан (в лимите) — копирование без перекодирования "
+                     "(границы совпадают с ключевыми кадрами).")
+        self.start_time = time.time()
+        try:
+            self.ffmpeg_proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE,
+                                                creationflags=CREATION_FLAGS,
+                                                cwd=EXE_DIR_SHORT)
+        except Exception as e:
+            logging.error(f"Не удалось запустить FFmpeg (copy): {e}")
+            self.encode_failed.emit(row)
+            return False
+        self._progress_thread = threading.Thread(target=self._read_ffmpeg_progress,
+                                                 args=(row,), daemon=True)
+        self._progress_thread.start()
+        return True
+
+    def _start_copy_or_encode(self, row, data, out):
+        """
+        Решает, можно ли для строки использовать быстрое копирование.
+        Возвращает True, если КОПИРОВАНИЕ уже запущено либо старт отложен
+        до завершения фоновой проверки keyframes (дальше код не идёт).
+        Возвращает False, если нужна обычная перекодировка (trim-фильтры).
+        Никогда не блокирует GUI: долгий ffprobe выполняется в QThread,
+        а после его завершения перекодировка запускается через сигнал.
+        """
+        crop_active = bool(data.get("crop_area") and data["crop_area"].strip())
+        res_active = bool(data.get("target_res") and data["target_res"] != "Оригинал")
+        if data.get("bitrate") is not None or crop_active or res_active:
+            return False  # перекодировка обязательна — идём дальше по run_ffmpeg_process
+        cache_key = (data["path"], int(round(max(0.0, data["start"]) * self.get_video_fps(data["path"]))))
+        cached = self.app._keyframe_cache.get(cache_key)
+        if cached is True:
+            return self._launch_copy(row, data, out)
+        if cached is False:
+            return False  # copy съел бы кадр — перекодируем поточно-точно
+        # Результата ещё нет — запускаем ФОНОВУЮ проверку, GUI не виснет
+        status_item = self.app.table.item(row, 4)
+        if status_item:
+            status_item.setText("Проверка кадров...")
+        check = KeyframeCheckThread(self, row, data, parent=self.app)
+        check.result_ready.connect(lambda r, acc: self._on_keyframe_check_done(r, acc, out))
+        self.app._keyframe_checks.append(check)
+        check.finished.connect(lambda c=check: self._drop_keyframe_check(c))
+        check.start()
+        return True
+
+    def _drop_keyframe_check(self, check):
+        try:
+            self.app._keyframe_checks.remove(check)
+        except ValueError:
+            pass
+
+    def _on_keyframe_check_done(self, row, accurate, out):
+        """Продолжение запуска строки после фоновой проверки keyframes."""
+        if self.stop_requested or row not in self.app.queue_data:
+            return
+        data = self.app.queue_data[row]
+        if accurate:
+            self._launch_copy(row, data, out)
+        else:
+            # copy начался бы не с выбранного кадра — перекодируем точно по кадрам
+            self.run_ffmpeg_process(row, self.app.custom_save_dir)
+
     def run_ffmpeg_process(self, row, custom_save_dir):
         try:
             if self.stop_requested:
@@ -843,7 +1164,48 @@ class SqueezerCore(QObject):
             self.app.current_output_file = out
             logging.info(f"Выходной файл: {out}")
 
+            # ИСПРАВЛЕНИЕ: если ролик с родным битрейтом уже в лимите и кроп/
+            # разрешение НЕ заданы — НЕ перекодировать вовсе: копируем потоки.
+            # ВАЖНО (точность обрезки): при -c copy отсечение возможно только
+            # по ключевым кадрам, поэтому перед копированием проверяем, что
+            # ближайший keyframe не «съедает» выбранный начальный кадр. Если
+            # съедает — молча переходим на перекодировку (она покадрово точна).
+            # Проверка keyframes может длиться десятки секунд, поэтому она
+            # фоновая (см. _start_copy_or_encode) — здесь используем только
+            # готовый закешированный результат, GUI никогда не блокируется.
+            if self._start_copy_or_encode(row, data, out):
+                return True  # запущено копирование ИЛИ отложен старт после проверки
+
             vf_filters = []
+            # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ТОЧНОСТИ ОБРЕЗКИ ПРИ ПЕРЕКОДИРОВАНИИ:
+            # вместо "-ss/-to" (которые в разных версиях ffmpeg и при
+            # аппаратном ускорении могут откатываться до ближайшего keyframe)
+            # используем покадровый фильтр trim — он вырезает РОВНО кадры
+            # start_frame..end_frame, выбранные ползунком.
+            # ИСПРАВЛЕНИЕ «СБОЙ»: ffmpeg 5.x понимает start_frame/end_frame в
+            # trim ТОЛЬКО для видео-потока. Если входной файл вообще без видео
+            # (или ffprobe не вернул видео-поток), фильтр падает с
+            # "Option start_frame ... not found" и вся строка получает статус
+            # «Сбой». Для аудио-только файлов обрезку делает -ss/-to ниже.
+            has_video = False
+            try:
+                vchk = subprocess.run(
+                    [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=index",
+                     "-of", "default=noprint_wrappers=1:nokey=1", data["path"]],
+                    capture_output=True, creationflags=CREATION_FLAGS, timeout=15)
+                has_video = bool(vchk.stdout.decode(errors="ignore").strip())
+            except Exception:
+                has_video = True  # не смогли проверить — поступаем как раньше
+
+            if has_video:
+                trimspec = self._frame_accurate_trimspec(data)
+                logging.info(f"Точная обрезка по кадрам: trim={trimspec} "
+                             f"(fps={self.get_video_fps(data['path'])})")
+                vf_filters.append(f"trim={trimspec}")
+                vf_filters.append("setpts=PTS-STARTPTS")
+            else:
+                logging.info("Видеопоток отсутствует — обрезка только по времени (-ss/-to)")
             if data.get("crop_area") and data["crop_area"] != " ":
                 vf_filters.append(f"crop={data['crop_area']}")
             if data.get("target_res") and data["target_res"] != "Оригинал":
@@ -857,17 +1219,28 @@ class SqueezerCore(QObject):
             args = [FFMPEG_EXE, "-y"]
 
             if self._has_nvidia_gpu():
-                args.extend(["-hwaccel", "cuda",
-                            "-ss", str(data["start"]), "-to", str(data["end"]), "-i", data["path"]])
+                # ИСПРАВЛЕНИЕ: аппаратное ускорение CUDA возвращалось, даже если
+                # ffmpeg собран БЕЗ nvenc — кодирование падало с ошибкой.
+                # Теперь проверяем наличие h264_nvenc в самом ffmpeg.
+                encoder = "h264_nvenc" if self._has_nvenc_encoder() else "libx264"
+                # ВАЖНО: -ss/-to УБРАНЫ из аргументов — обрезку выполняет
+                # фильтр trim (по номерам кадров), иначе при hwaccel кадр
+                # старта мог съезжать до ближайшего keyframe.
+                args.extend(["-hwaccel", "cuda", "-i", data["path"]])
                 if vf_filters:
                     args.extend(["-vf", ", ".join(vf_filters)])
-                # cbr вместо vbr для строгого контроля размера
-                args.extend(["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
-                            "-rc", "cbr", "-b:v", f"{data['bitrate']}k",
-                            "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k"])
+                if encoder == "h264_nvenc":
+                    # cbr вместо vbr для строгого контроля размера
+                    args.extend(["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
+                                 "-rc", "cbr", "-b:v", f"{data['bitrate']}k",
+                                 "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k"])
+                else:
+                    args.extend(["-c:v", "libx264", "-b:v", f"{data['bitrate']}k",
+                                 "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k",
+                                 "-preset", "medium"])
             else:
-                args.extend(["-ss", str(data["start"]), "-to", str(data["end"]),
-                            "-i", data["path"]])
+                # ВАЖНО: без -ss/-to — обрезка покадровая через фильтр trim
+                args.extend(["-i", data["path"]])
                 if vf_filters:
                     args.extend(["-vf", ", ".join(vf_filters)])
                 # maxrate и bufsize для контроля размера
@@ -875,7 +1248,28 @@ class SqueezerCore(QObject):
                             "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k",
                             "-preset", "medium"])
 
-            args.extend(["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out])
+            # ИСПРАВЛЕНИЕ «СБОЙ» (рассинхрон/обрезанное аудио): раньше -ss/-to
+            # стояли ПОСЛЕ -i (т.е. применялись к ВЫХОДУ). Видео при этом уже
+            # было обрезано фильтром trim и его PTS начинается с нуля, поэтому
+            # выходной -ss отсекал ещё start секунд ЗВУКА (или обрывал трек).
+            # Теперь аудио резуется тем же механизмом фильтров: atrim по
+            # временным границам + asetpts=PTS-STARTPTS — звук начинается
+            # ровно там же, где и видео. ПРИМЕЧАНИЕ: atrim НЕ поддерживает
+            # start_frame/end_frame (в отличие от trim) — проверено на ffmpeg
+            # 5.x, поэтому для аудио используются секунды start/end.
+            # Если видеопотока нет вообще (trim неприменим), обрезается и
+            # видео, и аудио через -ss/-to ДО -i (быстрый точный поиск входных
+            # пакетов для аудио-контейнеров корректен).
+            if has_video:
+                a_trim = (f"atrim=start={max(0.0, data['start']):.6f}:"
+                          f"end={max(0.0, data['end']):.6f},asetpts=PTS-STARTPTS")
+                args.extend(["-c:a", "aac", "-b:a", "128k",
+                             "-af", a_trim, "-movflags", "+faststart", out])
+            else:
+                args.extend(["-ss", f"{max(0.0, data['start']):.6f}",
+                             "-to", f"{max(0.0, data['end']):.6f}",
+                             "-c:a", "aac", "-b:a", "128k",
+                             "-movflags", "+faststart", out])
 
             logging.info(f"Запуск FFmpeg:")
             logging.info(f"  FFMPEG_EXE: {FFMPEG_EXE}")
@@ -1040,6 +1434,10 @@ class GpuSqueezerApp(QMainWindow):
 
         self.queue_data = {}
         self.current_encoding_row = -1
+        # Кэш проверки keyframes (путь, стартовый кадр) -> bool: copy точен или нет.
+        # Заполняется ФОНОВЫМ потоком KeyframeCheckThread — GUI не блокируется.
+        self._keyframe_cache = {}
+        self._keyframe_checks = []  # живые фоновые проверки (удержание ссылок)
         self.last_output_dir = os.path.expanduser("~")
         self.custom_save_dir = ""
         self.current_output_file = ""
@@ -1230,8 +1628,46 @@ class GpuSqueezerApp(QMainWindow):
         for row in range(self.table.rowCount()):
             self._recalculate_row_safely(row)
 
+        # Фоновая «прогревка» проверки keyframes для новых строк: долгий
+        # ffprobe запускается в QThread и кэшируется, поэтому ни добавление
+        # файлов, ни последующий запуск очереди не блокируют GUI и проводник.
+        for row in list(self.queue_data.keys()):
+            self._prefetch_keyframe_check(row)
+
         if was_empty and self.table.rowCount() > 0:
             self.table.setCurrentCell(0, 0)
+
+    def _prefetch_keyframe_check(self, row):
+        """Запускает проверку точности copy-обрезки в фоне (без блокировки)."""
+        data = self.queue_data.get(row)
+        if not data:
+            return
+        crop_active = bool(data.get("crop_area") and data["crop_area"].strip())
+        res_active = bool(data.get("target_res") and data["target_res"] != "Оригинал")
+        if data.get("bitrate") is not None or crop_active or res_active:
+            return  # перекодировка всё равно нужна — проверять бессмысленно
+        try:
+            fps = self.core.get_video_fps(data["path"])
+        except Exception:
+            return
+        cache_key = (data["path"], int(round(max(0.0, data["start"]) * fps)))
+        if cache_key in self._keyframe_cache:
+            return
+        check = KeyframeCheckThread(self.core, row, data, parent=self)
+        # Ключ кэша фиксируем сразу (path+стартовый кадр), чтобы результат
+        # попал ровно под тот ключ, который читает _start_copy_or_encode.
+        def _store(key, r, acc):
+            self._keyframe_cache[key] = acc
+        check.result_ready.connect(lambda r, acc, key=cache_key: _store(key, r, acc))
+        self._keyframe_checks.append(check)
+        check.finished.connect(lambda c=check: self._drop_check(c))
+        check.start()
+
+    def _drop_check(self, check):
+        try:
+            self._keyframe_checks.remove(check)
+        except ValueError:
+            pass
 
     def _recalculate_row_safely(self, row):
         if row not in self.queue_data:
@@ -1245,6 +1681,13 @@ class GpuSqueezerApp(QMainWindow):
         result = self.core.calculate_bitrate(row, strict, size_gb, global_val)
         if result:
             bitrate_val, status_text = result
+            if status_text == "__NOCODEC__":
+                # Ролик и так легче лимита — копируем без перекодирования
+                self.queue_data[row]["bitrate"] = None
+                self.table.setItem(row, 2, QTableWidgetItem("Без потерь (в лимите)"))
+                if row == self.table.currentRow():
+                    self.lbl_calculated_info.setText("В лимите — копирование без перекодирования")
+                return
             self.queue_data[row]["bitrate"] = bitrate_val
             self.table.setItem(row, 2, QTableWidgetItem(status_text))
             if row == self.table.currentRow():
@@ -1271,7 +1714,35 @@ class GpuSqueezerApp(QMainWindow):
                 pbar.setValue(100)
             self.table.setItem(row, 4, QTableWidgetItem("✓ Готово"))
         else:
-            self.table.setItem(row, 4, QTableWidgetItem("✗ Ошибка"))
+            # ИСПРАВЛЕНИЕ «СБОЙ»: показываем причину падения ffmpeg прямо в
+            # статусе строки (раньше было просто "✗ Ошибка" без объяснений).
+            reason = ""
+            try:
+                proc = getattr(self.core, "ffmpeg_proc", None)
+                if proc is not None and proc.stderr is not None:
+                    tail = b""
+                    try:
+                        while True:
+                            chunk = proc.stderr.read(2048)
+                            if not chunk:
+                                break
+                            tail = chunk[-4096:] if len(chunk) >= 4096 else (tail + chunk)[-4096:]
+                    except Exception:
+                        pass
+                    lines = [l.strip() for l in tail.decode(errors="ignore").splitlines() if l.strip()]
+                    for l in reversed(lines):
+                        low = l.lower()
+                        if ("error" in low or "invalid" in low or "not found" in low
+                                or "no such" in low or "failed" in low or "permission" in low):
+                            reason = l[:120]
+                            break
+            except Exception:
+                pass
+            status = f"✗ Ошибка кодом {exit_code}"
+            if reason:
+                status += f": {reason}"
+            logging.error(f"FFmpeg завершился с ошибкой (код {exit_code}): {reason or 'причина не распознана'}")
+            self.table.setItem(row, 4, QTableWidgetItem(status))
             # При ошибке очищаем путь, чтобы stop_process не удалил что-то лишнее
             self.current_output_file = ""
 
@@ -1283,7 +1754,7 @@ class GpuSqueezerApp(QMainWindow):
         self.current_output_file = ""
         if self.core.stop_requested:
             return
-        self.table.setItem(row, 4, QTableWidgetItem(" Сбой"))
+        self.table.setItem(row, 4, QTableWidgetItem("✗ Сбой"))
         self.encode_next()
 
     def recalculate_current_row(self):
@@ -1296,7 +1767,7 @@ class GpuSqueezerApp(QMainWindow):
             self.queue_data[row]["target_res"] = selected_res
             self._recalculate_row_safely(row)
             current_status = self.table.item(row, 4).text() if self.table.item(row, 4) else "В очереди"
-            if current_status not in ["Сжатие...", "✓ Готово", " Ошибка", "✗ Сбой"]:
+            if current_status not in ["Сжатие...", "✓ Готово", "✗ Ошибка", "✗ Сбой"]:
                 self.table.setItem(row, 4, QTableWidgetItem(f"Разрешение: {selected_res}"))
 
     def apply_resolution_to_all(self):
@@ -1472,7 +1943,25 @@ class GpuSqueezerApp(QMainWindow):
             self.core.stop_process(stop_whole_queue=False)
         except Exception as e:
             logging.error(f"Ошибка остановки процесса при закрытии: {e}")
-        
+
+        # ИСПРАВЛЕНИЕ: ждём завершения потока чтения прогресса, чтобы он не
+        # обращался к уже уничтожаемым Qt-объектам при выходе из приложения
+        try:
+            t = getattr(self.core, "_progress_thread", None)
+            if t is not None and t.is_alive():
+                t.join(timeout=3)
+        except Exception:
+            pass
+
+        # Ждём завершения фоновых проверок keyframes (иначе QThread может
+        # быть уничтожен на середине работы — предупреждения/вылеты при выходе)
+        for c in list(self._keyframe_checks):
+            try:
+                c.requestInterruption()
+                c.wait(2000)
+            except Exception:
+                pass
+
         event.accept()
 
 
@@ -1554,42 +2043,56 @@ def _apply_runtime_paths():
     logging.info(f"Обновлённые пути: FFMPEG_EXE={FFMPEG_EXE}, FFPROBE_EXE={FFPROBE_EXE}")
 
 
+def _hide_console_windows():
+    """Гарантированное скрытие консоли на Windows (если она всё ещё есть).
+
+    Вызывается как страховка в тех редких случаях, когда перезапуск через
+    pythonw.exe невозможен (например, в окружении нет pythonw.exe):
+    окно консоли прячется через ShowWindow(SW_HIDE), а затем процесс
+    отсоединяется от неё через FreeConsole.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            SW_HIDE = 0
+            user32.ShowWindow(hwnd, SW_HIDE)
+            kernel32.FreeConsole()
+    except Exception:
+        pass
+
+
 def main():
     """
     Старт приложения без консоли единым окном:
-    - .pyw / pythonw или PyInstaller (--windowed/--noconsole) консоль уже отсутствует;
-    - при запуске из обычной консоли на Windows процесс перезапускается через
-      pythonw detached-режимом, чтобы было только одно окно без чёрного окна.
-    Также при старте автоматически скачиваются недостающие компоненты (ffmpeg/ffprobe).
+    - консольное окно закрывается/прячется в самом начале файла (перезапуск
+      через pythonw.exe до импорта PyQt + гарантированное скрытие через
+      Windows API как страховка);
+    - для собранного EXE используется PyInstaller с флагом --noconsole
+      (--windowed), тогда чёрного окна нет по построению;
+    - при старте автоматически скачиваются недостающие компоненты
+      (ffmpeg/ffprobe).
     """
-    if sys.platform == "win32" and not getattr(sys, 'frozen', False) \
-            and not os.environ.get("SQUEEZER_NO_CONSOLE"):
-        try:
-            if sys.stdout is None or sys.stderr is None:
-                # Уже запущены через pythonw — консоли нет
-                os.environ["SQUEEZER_NO_CONSOLE"] = "1"
-            else:
-                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-                if os.path.exists(pythonw):
-                    os.environ["SQUEEZER_NO_CONSOLE"] = "1"
-                    DETACHED = 0x00000008 | 0x00000010  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                    subprocess.Popen([pythonw] + sys.argv, creationflags=DETACHED,
-                                     close_fds=True)
-                    sys.exit(0)
-        except SystemExit:
-            raise
-        except Exception as e:
-            logging.warning(f"Перезапуск без консоли не удался ({e}), продолжаем в текущем процессе.")
+    # Страховка: если по какой-то причине мы всё ещё запущены с консолью
+    # (pythonw.exe недоступен и т.п.) — скрываем её немедленно.
+    _hide_console_windows()
 
     app = QApplication(sys.argv)
 
     # --- Автопроверка/скачивание недостающих компонентов при старте ---
-    loader = ComponentLoaderDialog()
-    loader.start_loading()
-    loader.exec()
+    loader = None
+    if not _components_present():
+        # ИСПРАВЛЕНИЕ: окно скачивания показываем ТОЛЬКО когда компоненты
+        # реально отсутствуют — иначе оно мелькало на каждом запуске.
+        loader = ComponentLoaderDialog()
+        loader.start_loading()
+        loader.exec()
 
     _apply_runtime_paths()
-    if loader._result:
+    if loader is not None and loader._result:
         QMessageBox.warning(None, "Компоненты не установлены",
                             "\n".join(loader._result) +
                             "\n\nПриложение запустится, но конвертация будет недоступна, "
