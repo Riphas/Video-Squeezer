@@ -209,6 +209,15 @@ def ensure_components(progress_cb=None, status_cb=None):
                     f"Установите ffmpeg вручную или положите ffmpeg/ffprobe рядом с программой.")
     return problems
 
+
+def _components_present():
+    """True, если ffmpeg/ffprobe лежат рядом с программой или есть в PATH."""
+    binaries = ("ffmpeg.exe", "ffprobe.exe") if sys.platform == "win32" else ("ffmpeg", "ffprobe")
+    if all(os.path.exists(os.path.join(EXE_DIR, b)) for b in binaries):
+        return True
+    return all(shutil.which(b.replace(".exe", "")) for b in binaries)
+
+
 def get_short_path(long_path):
     if sys.platform != "win32":
         return long_path
@@ -762,6 +771,7 @@ class SqueezerCore(QObject):
         self.ffmpeg_proc = None
         self.start_time = 0.0
         self._probe_cache = {}
+        self._nvenc_cache = None  # есть ли h264_nvenc в текущем ffmpeg (кэш)
         # Флаг глобальной остановки: когда True — текущее видео прерывается,
         # а оставшаяся очередь помечается остановленной (останавливаются ВСЕ сразу)
         self.stop_requested = False
@@ -825,6 +835,36 @@ class SqueezerCore(QObject):
         data["source_bitrate"] = source_bitrate
 
         if strict_limit:
+            # ИСПРАВЛЕНИЕ: сравниваем с ПОЛНЫМ родным битрейтом файла (видео+аудио),
+            # т.к. лимит размера относится ко всему файлу. Раньше видео-битрейт
+            # сравнивался с общим битрейдом контейнера — из-за этого при близких
+            # значениях включалась перекодировка и файл раздувало до лимита.
+            try:
+                source_total_bitrate = int(self._probe(data["path"], "bitrate_total",
+                                                       [FFPROBE_EXE, "-v", "error", "-show_entries",
+                                                        "format=bit_rate",
+                                                        "-of", "default=noprint_wrappers=1:nokey=1",
+                                                        data["path"]]) / 1000)
+            except (ValueError, TypeError):
+                source_total_bitrate = 0
+            if source_total_bitrate <= 0:
+                # запасной вариант: видео + аудио
+                source_total_bitrate = source_bitrate + 128 if source_bitrate else 0
+
+            # Если ролик с РОДНЫМ битрейтом весит меньше целевого лимита —
+            # НЕ повышаем битрейт искусственно: оставляем родной.
+            # (Копирование без перекодирования применяется только когда не
+            # заданы кроп/изменение разрешения — иначе фильтр требует перекодировки.)
+            if source_total_bitrate > 0 and source_total_bitrate * duration <= target_size_gb * 0.95 * 1024 * 1024 * 1024 * 8:
+                crop_active = data.get("crop_area") and data["crop_area"].strip() not in ("", " ")
+                res_active = data.get("target_res") and data["target_res"] != "Оригинал"
+                if not crop_active and not res_active:
+                    return None, "__NOCODEC__"
+                video_bitrate = source_bitrate if source_bitrate > 0 else source_total_bitrate - 128
+                status_text = f"{video_bitrate} кб/с (родной, в лимите {target_size_gb} ГБ)"
+                return video_bitrate, status_text
+
+            # Ролик тяжелее лимита — считаем видеобитрейт под лимит
             # Запас 5%
             safe_target_gb = max(0.05, target_size_gb * 0.95)
             target_bits = safe_target_gb * 1024 * 1024 * 1024 * 8
@@ -863,6 +903,19 @@ class SqueezerCore(QObject):
         except Exception:
             return False
 
+    def _has_nvenc_encoder(self):
+        """Проверяет, что конкретный ffmpeg собран с h264_nvenc (кэшируется)."""
+        if self._nvenc_cache is not None:
+            return self._nvenc_cache
+        try:
+            out = subprocess.run([FFMPEG_EXE, "-hide_banner", "-encoders"],
+                                 capture_output=True, creationflags=CREATION_FLAGS, timeout=15)
+            text = (out.stdout + out.stderr).decode(errors="ignore")
+            self._nvenc_cache = "h264_nvenc" in text
+        except Exception:
+            self._nvenc_cache = False
+        return self._nvenc_cache
+
     def run_ffmpeg_process(self, row, custom_save_dir):
         try:
             if self.stop_requested:
@@ -884,6 +937,30 @@ class SqueezerCore(QObject):
             self.app.current_output_file = out
             logging.info(f"Выходной файл: {out}")
 
+            # ИСПРАВЛЕНИЕ: если ролик с родным битрейтом уже в лимите —
+            # НЕ перекодировать вовсе: копируем виде/аудио потоки (stream copy),
+            # сохраняя оригинальное качество и размер.
+            if data.get("bitrate") is None:
+                args = [FFMPEG_EXE, "-y",
+                        "-ss", str(data["start"]), "-to", str(data["end"]),
+                        "-i", data["path"],
+                        "-c", "copy", "-movflags", "+faststart", out]
+                logging.info("Битрейт не задан (в лимите) — копирование без перекодирования.")
+                self.start_time = time.time()
+                try:
+                    self.ffmpeg_proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                                        stderr=subprocess.PIPE,
+                                                        creationflags=CREATION_FLAGS,
+                                                        cwd=EXE_DIR_SHORT)
+                except Exception as e:
+                    logging.error(f"Не удалось запустить FFmpeg (copy): {e}")
+                    self.encode_failed.emit(row)
+                    return False
+                self._progress_thread = threading.Thread(target=self._read_ffmpeg_progress,
+                                                         args=(row,), daemon=True)
+                self._progress_thread.start()
+                return True
+
             vf_filters = []
             if data.get("crop_area") and data["crop_area"] != " ":
                 vf_filters.append(f"crop={data['crop_area']}")
@@ -898,17 +975,25 @@ class SqueezerCore(QObject):
             args = [FFMPEG_EXE, "-y"]
 
             if self._has_nvidia_gpu():
-                args.extend(["-hwaccel", "cuda",
-                            "-ss", str(data["start"]), "-to", str(data["end"]), "-i", data["path"]])
+                # ИСПРАВЛЕНИЕ: аппаратное ускорение CUDA возвращалось, даже если
+                # ffmpeg собран БЕЗ nvenc — кодирование падало с ошибкой.
+                # Теперь проверяем наличие h264_nvenc в самом ffmpeg.
+                encoder = "h264_nvenc" if self._has_nvenc_encoder() else "libx264"
+                args.extend(["-hwaccel", "cuda", "-i", data["path"],
+                             "-ss", str(data["start"]), "-to", str(data["end"])])
                 if vf_filters:
                     args.extend(["-vf", ", ".join(vf_filters)])
-                # cbr вместо vbr для строгого контроля размера
-                args.extend(["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
-                            "-rc", "cbr", "-b:v", f"{data['bitrate']}k",
-                            "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k"])
+                if encoder == "h264_nvenc":
+                    # cbr вместо vbr для строгого контроля размера
+                    args.extend(["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
+                                 "-rc", "cbr", "-b:v", f"{data['bitrate']}k",
+                                 "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k"])
+                else:
+                    args.extend(["-c:v", "libx264", "-b:v", f"{data['bitrate']}k",
+                                 "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k",
+                                 "-preset", "medium"])
             else:
-                args.extend(["-ss", str(data["start"]), "-to", str(data["end"]),
-                            "-i", data["path"]])
+                args.extend(["-i", data["path"], "-ss", str(data["start"]), "-to", str(data["end"])])
                 if vf_filters:
                     args.extend(["-vf", ", ".join(vf_filters)])
                 # maxrate и bufsize для контроля размера
@@ -1286,6 +1371,13 @@ class GpuSqueezerApp(QMainWindow):
         result = self.core.calculate_bitrate(row, strict, size_gb, global_val)
         if result:
             bitrate_val, status_text = result
+            if status_text == "__NOCODEC__":
+                # Ролик и так легче лимита — копируем без перекодирования
+                self.queue_data[row]["bitrate"] = None
+                self.table.setItem(row, 2, QTableWidgetItem("Без потерь (в лимите)"))
+                if row == self.table.currentRow():
+                    self.lbl_calculated_info.setText("В лимите — копирование без перекодирования")
+                return
             self.queue_data[row]["bitrate"] = bitrate_val
             self.table.setItem(row, 2, QTableWidgetItem(status_text))
             if row == self.table.currentRow():
@@ -1513,7 +1605,16 @@ class GpuSqueezerApp(QMainWindow):
             self.core.stop_process(stop_whole_queue=False)
         except Exception as e:
             logging.error(f"Ошибка остановки процесса при закрытии: {e}")
-        
+
+        # ИСПРАВЛЕНИЕ: ждём завершения потока чтения прогресса, чтобы он не
+        # обращался к уже уничтожаемым Qt-объектам при выходе из приложения
+        try:
+            t = getattr(self.core, "_progress_thread", None)
+            if t is not None and t.is_alive():
+                t.join(timeout=3)
+        except Exception:
+            pass
+
         event.accept()
 
 
@@ -1635,12 +1736,16 @@ def main():
     app = QApplication(sys.argv)
 
     # --- Автопроверка/скачивание недостающих компонентов при старте ---
-    loader = ComponentLoaderDialog()
-    loader.start_loading()
-    loader.exec()
+    loader = None
+    if not _components_present():
+        # ИСПРАВЛЕНИЕ: окно скачивания показываем ТОЛЬКО когда компоненты
+        # реально отсутствуют — иначе оно мелькало на каждом запуске.
+        loader = ComponentLoaderDialog()
+        loader.start_loading()
+        loader.exec()
 
     _apply_runtime_paths()
-    if loader._result:
+    if loader is not None and loader._result:
         QMessageBox.warning(None, "Компоненты не установлены",
                             "\n".join(loader._result) +
                             "\n\nПриложение запустится, но конвертация будет недоступна, "
