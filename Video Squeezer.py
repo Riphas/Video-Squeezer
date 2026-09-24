@@ -6,6 +6,10 @@ CachyOS GPU Squeezer - Видео конвертер с аппаратным у�
 """
 import os
 import sys
+import stat
+import shutil
+import zipfile
+import tarfile
 import subprocess
 import re
 import time
@@ -14,11 +18,12 @@ import tempfile
 import traceback
 import threading
 import ctypes
+import urllib.request
 from PyQt6.QtWidgets import (QMainWindow, QApplication, QTableWidgetItem, QTableWidget, QProgressBar,
                              QFileDialog, QLabel, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLineEdit, QHeaderView, QAbstractItemView,
                              QComboBox, QSlider, QCheckBox, QDialog, QMessageBox)
-from PyQt6.QtCore import (QObject, pyqtSignal, QSettings, QUrl, Qt,
+from PyQt6.QtCore import (QObject, pyqtSignal, QSettings, QUrl, Qt, QTimer,
                           QRect, QPoint, QSize, QThread)
 from PyQt6.QtGui import (QIcon, QImage, QPainter, QColor, QBrush, QPen, QPixmap)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
@@ -33,6 +38,135 @@ def get_exe_dir():
 
 EXE_DIR = get_exe_dir()
 CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+# ============================================================================
+# АВТОМАТИЧЕСКОЕ СКАЧИВАНИЕ НЕДОСТАЮЩИХ КОМПОНЕНТОВ (ffmpeg / ffprobe)
+# ============================================================================
+FFMPEG_WIN_URL = ("https://www.gyan.dev/ffmpeg/builds/"
+                  "ffmpeg-release-essentials.zip")
+FFMPEG_LINUX_URLS = [
+    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz",
+]
+
+
+def _make_executable(path):
+    try:
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        pass
+
+
+def _find_binary(root, names):
+    """Рекурсивно ищет исполняемые файлы с указанными именами внутри распакованной архива."""
+    found = {}
+    for dirpath, _, filenames in os.walk(root):
+        for fname in filenames:
+            if fname in names and fname not in found:
+                found[fname] = os.path.join(dirpath, fname)
+        if len(found) == len(names):
+            break
+    return found
+
+
+def _download_file(url, dest, reporthook=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (GPU-Squeezer)"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+        total = int(resp.headers.get("Content-Length", "0"))
+        block_size = 1024 * 256
+        while True:
+            chunk = resp.read(block_size)
+            if not chunk:
+                break
+            out.write(chunk)
+            if reporthook:
+                reporthook(out.tell(), block_size, total)
+
+
+def _extract_archive(archive_path, extract_dir):
+    if archive_path.lower().endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as zf:
+            zf.extractall(extract_dir)
+    elif archive_path.endswith((".tar.xz", ".tar.gz")):
+        mode = "r:xz" if archive_path.endswith(".tar.xz") else "r:gz"
+        with tarfile.open(archive_path, mode) as tf:
+            tf.extractall(extract_dir)
+    else:
+        raise ValueError(f"Неизвестный формат архива: {archive_path}")
+
+
+def ensure_components(progress_cb=None, status_cb=None):
+    """
+    Проверяет наличие ffmpeg/ffprobe при старте и скачивает недостающие.
+    progress_cb(procents), status_cb(текст). Возвращает список проблем (пуст если всё ок).
+    """
+    problems = []
+    binaries = ("ffmpeg.exe", "ffprobe.exe") if sys.platform == "win32" else ("ffmpeg", "ffprobe")
+
+    def binary_ok(path):
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            r = subprocess.run([path, "-version"], capture_output=True,
+                               creationflags=CREATION_FLAGS, timeout=15)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # 1. Локальные файлы рядом с программой
+    local_ok = all(binary_ok(os.path.join(EXE_DIR, b)) for b in binaries)
+    if local_ok:
+        logging.info("Компоненты ffmpeg/ffprobe найдены локально — скачивание не требуется.")
+        return problems
+
+    # 2. Системный PATH
+    if all(shutil.which(b.replace(".exe", "")) for b in binaries):
+        logging.info("Компоненты найдены в системе (PATH) — скачивание не требуется.")
+        return problems
+
+    # 3. Скачиваем portable-сборку
+    urls = [FFMPEG_WIN_URL] if sys.platform == "win32" else FFMPEG_LINUX_URLS
+    last_err = None
+    for url in urls:
+        try:
+            if status_cb:
+                status_cb(f"Скачивание компонентов:\n{url}")
+            tmp_dir = tempfile.mkdtemp(prefix="squeezer_dl_")
+            archive_name = "ffmpeg_archive" + (".zip" if url.endswith(".zip")
+                                               else (".tar.xz" if url.endswith(".tar.xz") else ".tar.gz"))
+            archive_path = os.path.join(tmp_dir, archive_name)
+            _download_file(url, archive_path, reporthook=lambda n, bs, tot:
+                           progress_cb(min(90, int(n * bs * 100 / tot))) if progress_cb and tot > 0 else None)
+            if progress_cb:
+                progress_cb(92)
+            if status_cb:
+                status_cb("Распаковка компонентов...")
+            extract_dir = os.path.join(tmp_dir, "extracted")
+            _extract_archive(archive_path, extract_dir)
+            if progress_cb:
+                progress_cb(97)
+            found = _find_binary(extract_dir, set(binaries))
+            if len(found) != len(binaries):
+                raise RuntimeError("В архиве не найдены нужные исполняемые файлы")
+            for name, src in found.items():
+                dst = os.path.join(EXE_DIR, name)
+                shutil.copy2(src, dst)
+                _make_executable(dst)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if all(binary_ok(os.path.join(EXE_DIR, b)) for b in binaries):
+                logging.info(f"Компоненты успешно скачаны в {EXE_DIR}")
+                if progress_cb:
+                    progress_cb(100)
+                return problems
+            raise RuntimeError("Скачанные файлы не запускаются")
+        except Exception as e:
+            last_err = e
+            logging.error(f"Не удалось скачать компоненты из {url}: {e}")
+            shutil.rmtree(tmp_dir, ignore_errors=True) if 'tmp_dir' in locals() and os.path.exists(tmp_dir) else None
+
+    problems.append(f"Автоматическое скачивание не удалось: {last_err}. "
+                    f"Установите ffmpeg вручную или положите ffmpeg/ffprobe рядом с программой.")
+    return problems
 
 def get_short_path(long_path):
     if sys.platform != "win32":
@@ -587,6 +721,9 @@ class SqueezerCore(QObject):
         self.ffmpeg_proc = None
         self.start_time = 0.0
         self._probe_cache = {}
+        # Флаг глобальной остановки: когда True — текущее видео прерывается,
+        # а оставшаяся очередь помечается остановленной (останавливаются ВСЕ сразу)
+        self.stop_requested = False
 
     def _probe(self, path, args_key, cmd):
         """Кешируемый вызов ffprobe — повторные вызовы мгновенные"""
@@ -639,6 +776,13 @@ class SqueezerCore(QObject):
         if duration <= 0:
             return None
 
+        # "Родной" битрейт источника (кб/с) — нужен для проверки лимита размера
+        try:
+            source_bitrate = int(data.get("source_bitrate") or self.get_source_bitrate(data["path"]))
+        except Exception:
+            source_bitrate = 0
+        data["source_bitrate"] = source_bitrate
+
         if strict_limit:
             # Запас 5%
             safe_target_gb = max(0.05, target_size_gb * 0.95)
@@ -648,11 +792,17 @@ class SqueezerCore(QObject):
             video_bits_available = target_bits - audio_bits_total
             calculated_video_bitrate = int(video_bits_available / 1000 / duration)
             calculated_video_bitrate = max(100, calculated_video_bitrate)
-            
-            # ВСЕГДА используем calculated_video_bitrate — даже если он больше оригинала
-            video_bitrate = calculated_video_bitrate
-            status_text = f"{video_bitrate} кб/с (Строго до {target_size_gb} ГБ)"
-            
+
+            if source_bitrate > 0 and calculated_video_bitrate >= source_bitrate:
+                # ИСПРАВЛЕНИЕ: ролик с родным битрейтом весит МЕНЬШЕ лимита —
+                # искусственно повышать битрейт нельзя, оставляем родной.
+                video_bitrate = source_bitrate
+                status_text = f"{video_bitrate} кб/с (родной, в лимите {target_size_gb} ГБ)"
+            else:
+                # Ролик тяжелее лимита — понижаем битрейт до расчётного
+                video_bitrate = calculated_video_bitrate
+                status_text = f"{video_bitrate} кб/с (Строго до {target_size_gb} ГБ)"
+
         elif data.get("custom_enabled"):
             try: video_bitrate = int(data["custom_val"])
             except Exception: video_bitrate = 6500
@@ -674,6 +824,8 @@ class SqueezerCore(QObject):
 
     def run_ffmpeg_process(self, row, custom_save_dir):
         try:
+            if self.stop_requested:
+                return False
             if row not in self.app.queue_data:
                 self.encode_failed.emit(row)
                 return False
@@ -800,13 +952,19 @@ class SqueezerCore(QObject):
             logging.error(traceback.format_exc())
             self.encode_failed.emit(row)
 
-    def stop_process(self):
+    def stop_process(self, stop_whole_queue=True):
         """
-        ИСПРАВЛЕНИЕ: удаляем файл ТОЛЬКО если процесс был принудительно убит.
-        Раньше файл удалялся всегда, даже если кодирование завершилось успешно!
+        ИСПРАВЛЕНИЕ: остановка теперь действует на ВСЮ очередь сразу.
+        1) Убивается текущий процесс FFmpeg;
+        2) Выставляется флаг stop_requested — encode_next больше не запустит следующее видео;
+        3) Все неотработанные строки очереди помечаются "Остановлено".
+        Файл удаляется ТОЛЬКО если процесс был принудительно убит.
         """
         row = self.app.current_encoding_row
         self.app.current_encoding_row = -1
+
+        if stop_whole_queue:
+            self.stop_requested = True
 
         # Флаг: действительно ли мы принудительно убили процесс?
         process_was_killed = False
@@ -833,10 +991,23 @@ class SqueezerCore(QObject):
         if row != -1 and row in self.app.queue_data:
             status_item = self.app.table.item(row, 4)
             if status_item:
-                status_item.setText("В очереди")
+                status_item.setText("Остановлено" if stop_whole_queue else "В очереди")
             pbar = self.app.table.cellWidget(row, 3)
             if isinstance(pbar, QProgressBar):
                 pbar.setValue(0)
+
+        # ИСПРАВЛЕНИЕ: помечаем ВСЮ оставшуюся очередь как остановленную,
+        # чтобы ни одно следующее видео не запускалось
+        if stop_whole_queue:
+            for r in range(self.app.table.rowCount()):
+                s_item = self.app.table.item(r, 4)
+                if s_item:
+                    txt = s_item.text()
+                    if txt in ("Сжатие...", "В очереди", "Кроп задан") or "Разрешение:" in txt:
+                        s_item.setText("Остановлено")
+                        pb = self.app.table.cellWidget(r, 3)
+                        if isinstance(pb, QProgressBar):
+                            pb.setValue(0)
 
         out_file = getattr(self.app, 'current_output_file', '')
         # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: удаляем файл ТОЛЬКО если процесс был убит
@@ -1013,12 +1184,10 @@ class GpuSqueezerApp(QMainWindow):
         self.setCentralWidget(widget)
 
     def stop_queue(self):
-        logging.info("Пользователь нажал Остановить")
-        self.core.stop_process()
-        for row in range(self.table.rowCount()):
-            status_item = self.table.item(row, 4)
-            if status_item and status_item.text() == "Сжатие...":
-                status_item.setText("В очереди")
+        logging.info("Пользователь нажал Остановить (останавливается ВСЯ очередь)")
+        # ИСПРАВЛЕНИЕ: stop_process теперь сам убивает текущий процесс,
+        # выставляет флаг остановки и помечает все оставшиеся строки "Остановлено"
+        self.core.stop_process(stop_whole_queue=True)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -1091,6 +1260,11 @@ class GpuSqueezerApp(QMainWindow):
         logging.info(f"Кодирование строки {row} завершено с кодом {exit_code}")
         self.current_encoding_row = -1
 
+        if self.core.stop_requested:
+            # Пользователь остановил ВСЮ очередь — ничего не перезапускаем,
+            # статусы уже расставлены в stop_process
+            return
+
         if exit_code == 0:
             pbar = self.table.cellWidget(row, 3)
             if isinstance(pbar, QProgressBar):
@@ -1105,9 +1279,11 @@ class GpuSqueezerApp(QMainWindow):
 
     def on_encode_failed(self, row):
         logging.error(f"Сбой строки {row}")
-        self.table.setItem(row, 4, QTableWidgetItem(" Сбой"))
         self.current_encoding_row = -1
         self.current_output_file = ""
+        if self.core.stop_requested:
+            return
+        self.table.setItem(row, 4, QTableWidgetItem(" Сбой"))
         self.encode_next()
 
     def recalculate_current_row(self):
@@ -1236,6 +1412,8 @@ class GpuSqueezerApp(QMainWindow):
             self.on_slider_range_moved(self.player.slider.start_pos, curr_ms)
 
     def encode_next(self):
+        if self.core.stop_requested:
+            return
         if self.current_encoding_row != -1:
             return
         for row in range(self.table.rowCount()):
@@ -1263,6 +1441,8 @@ class GpuSqueezerApp(QMainWindow):
         if not has_pending:
             QMessageBox.information(self, "Нечего сжимать", "Все файлы уже обработаны.")
             return
+        # Пользователь снова нажал "Запустить" — снимаем флаг остановки очереди
+        self.core.stop_requested = False
         self.encode_next()
 
     def load_saved_settings(self):
@@ -1287,14 +1467,138 @@ class GpuSqueezerApp(QMainWindow):
         self.settings.setValue("target_size_gb", self.txt_target_size.text())
         self.settings.setValue("custom_save_dir", self.custom_save_dir)
         
-        # Принудительно останавливаем процесс
-        self.core.stop_process()
+        # Принудительно останавливаем процесс (файл-заглушку для update() не создаём)
+        try:
+            self.core.stop_process(stop_whole_queue=False)
+        except Exception as e:
+            logging.error(f"Ошибка остановки процесса при закрытии: {e}")
         
         event.accept()
 
 
-if __name__ == "__main__":
+# ============================================================================
+# ОКНО ЗАГРУЗКИ КОМПОНЕНТОВ + СТАРТ БЕЗ КОНСОЛИ
+# ============================================================================
+class ComponentLoaderDialog(QDialog):
+    """Модальное окно 'единым окном' — показывает прогресс скачивания компонентов."""
+    progress_updated = pyqtSignal(int)
+    status_changed = pyqtSignal(str)
+    finished_loading = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CachyOS GPU Squeezer — подготовка")
+        self.setFixedSize(460, 170)
+        # Убираем крестик — диалог модальный и закрывается сам по завершении загрузки
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
+                            & ~Qt.WindowType.WindowCloseButtonHint)
+        self.problems = []
+
+        layout = QVBoxLayout(self)
+        self.lbl_status = QLabel("Проверка недостающих компонентов (ffmpeg/ffprobe)...")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+
+        self._result = None
+        self._thread = None
+
+        self.progress_updated.connect(self.progress.setValue)
+        self.status_changed.connect(self.lbl_status.setText)
+        self.finished_loading.connect(self._on_finished)
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(150)
+        self._poll_timer.timeout.connect(self._check_done)
+
+    def start_loading(self):
+        # Фоновый поток скачивает компоненты; сигналы Qt гарантированно
+        # доставляются в главный поток, GUI не блокируется
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        self._poll_timer.start()
+
+    def _worker(self):
+        try:
+            problems = ensure_components(
+                progress_cb=lambda p: self.progress_updated.emit(p),
+                status_cb=lambda t: self.status_changed.emit(t))
+        except Exception as e:
+            logging.error(f"Ошибка загрузчика компонентов: {e}")
+            problems = [str(e)]
+        self.finished_loading.emit(problems)
+
+    def _on_finished(self, problems):
+        self._result = problems
+
+    def _check_done(self):
+        if self._result is not None:
+            self._poll_timer.stop()
+            self.accept()
+
+
+def _apply_runtime_paths():
+    """После возможного скачивания пересчитываем пути к ffmpeg/ffprobe."""
+    global FFMPEG_LONG, FFPROBE_LONG, FFMPEG_EXE, FFPROBE_EXE
+    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    probe_name = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+    local_ff = os.path.join(EXE_DIR, exe_name)
+    local_fp = os.path.join(EXE_DIR, probe_name)
+    FFMPEG_LONG = local_ff if os.path.exists(local_ff) else "ffmpeg"
+    FFPROBE_LONG = local_fp if os.path.exists(local_fp) else "ffprobe"
+    FFMPEG_EXE = get_short_path(FFMPEG_LONG)
+    FFPROBE_EXE = get_short_path(FFPROBE_LONG)
+    logging.info(f"Обновлённые пути: FFMPEG_EXE={FFMPEG_EXE}, FFPROBE_EXE={FFPROBE_EXE}")
+
+
+def main():
+    """
+    Старт приложения без консоли единым окном:
+    - .pyw / pythonw или PyInstaller (--windowed/--noconsole) консоль уже отсутствует;
+    - при запуске из обычной консоли на Windows процесс перезапускается через
+      pythonw detached-режимом, чтобы было только одно окно без чёрного окна.
+    Также при старте автоматически скачиваются недостающие компоненты (ffmpeg/ffprobe).
+    """
+    if sys.platform == "win32" and not getattr(sys, 'frozen', False) \
+            and not os.environ.get("SQUEEZER_NO_CONSOLE"):
+        try:
+            if sys.stdout is None or sys.stderr is None:
+                # Уже запущены через pythonw — консоли нет
+                os.environ["SQUEEZER_NO_CONSOLE"] = "1"
+            else:
+                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                if os.path.exists(pythonw):
+                    os.environ["SQUEEZER_NO_CONSOLE"] = "1"
+                    DETACHED = 0x00000008 | 0x00000010  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                    subprocess.Popen([pythonw] + sys.argv, creationflags=DETACHED,
+                                     close_fds=True)
+                    sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logging.warning(f"Перезапуск без консоли не удался ({e}), продолжаем в текущем процессе.")
+
     app = QApplication(sys.argv)
+
+    # --- Автопроверка/скачивание недостающих компонентов при старте ---
+    loader = ComponentLoaderDialog()
+    loader.start_loading()
+    loader.exec()
+
+    _apply_runtime_paths()
+    if loader._result:
+        QMessageBox.warning(None, "Компоненты не установлены",
+                            "\n".join(loader._result) +
+                            "\n\nПриложение запустится, но конвертация будет недоступна, "
+                            "пока ffmpeg/ffprobe не появятся в папке программы или в PATH.")
+
     window = GpuSqueezerApp()
     window.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
