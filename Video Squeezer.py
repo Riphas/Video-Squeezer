@@ -516,9 +516,19 @@ class SqueezerPlayer(QWidget):
             self._loader_thread.metadata_ready.connect(self._on_metadata_loaded)
             self._loader_thread.start()
 
-            self.media_player.setSource(QUrl.fromLocalFile(path))
-            self.media_player.play()
-            self.media_player.pause()
+            # setSource + play/pause выполнялись СИНХРОННО в потоке GUI:
+            # медиа-бэкенд Qt открывал файл прямо во время клика по строке,
+            # из-за чего на больших/медленных файлах интерфейс подвисал.
+            # Переносим «раскрутку» плеера на следующий цикл событий —
+            # окно остаётся отзывчивым, переключение строк не блокируется.
+            def _start_playback():
+                try:
+                    self.media_player.setSource(QUrl.fromLocalFile(path))
+                    self.media_player.play()
+                    self.media_player.pause()
+                except Exception as e:
+                    logging.error(f"Ошибка загрузки источника: {e}")
+            QTimer.singleShot(0, _start_playback)
 
             self.video_canvas.update()
         except Exception as e:
@@ -765,6 +775,33 @@ class CropDialog(QDialog):
 
 
 # ============================================================================
+# ФОНОВАЯ ПРОВЕРКА ТОЧНОСТИ COPY-ОБРЕЗКИ (keyframes)
+# ============================================================================
+class KeyframeCheckThread(QThread):
+    """
+    Проверяет в фоновом потоке, можно ли обрезать ролик копированием
+    потоков без потери выбранного начального кадра. Синхронный запуск
+    этой проверки вешал GUI и блокировал проводник Windows: ffprobe со
+    -skip_frame nokey читает гигабайты данных десятки секунд.
+    """
+    result_ready = pyqtSignal(int, bool)  # row, is_accurate
+
+    def __init__(self, core, row, data, parent=None):
+        super().__init__(parent)
+        self.core = core
+        self.row = row
+        self.data = dict(data)  # снимок — на случай изменения очереди
+
+    def run(self):
+        try:
+            accurate = self.core._copy_trim_is_frame_accurate(self.data)
+        except Exception as e:
+            logging.error(f"KeyframeCheckThread: {e}")
+            accurate = False
+        self.result_ready.emit(self.row, accurate)
+
+
+# ============================================================================
 # ЯДРО С КЕШИРОВАНИЕМ FFPROBE
 # ============================================================================
 class SqueezerCore(QObject):
@@ -862,6 +899,11 @@ class SqueezerCore(QObject):
         при -c copy откатится назад/вперёд до ближайшего ключевой кадра и
         начало ролика сдвинется — в этом случае возвращаем False, и программа
         перекодирует ролик (перекодирование покадрово точное).
+
+        ВАЖНО: проверка выполняется АСИНХРОННО (см. KeyframeCheckThread),
+        т.к. ffprobe со сканированием ключевых кадров может читать гигабайты
+        данных и занимать десятки секунд — синхронный вызов вешал GUI и
+        блокировал проводник Windows (общий кэш файлов). Результат кэшируется.
         """
         try:
             fps = self.get_video_fps(data["path"])
@@ -869,6 +911,10 @@ class SqueezerCore(QObject):
             return False
         # кадры, между которыми ищем keyframe вокруг стартовой границы
         start_f = int(round(max(0.0, data["start"]) * fps))
+        cache_key = (data["path"], start_f)
+        cached = self.app._keyframe_cache.get(cache_key)
+        if cached is not None:
+            return cached
         cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0",
                "-skip_frame", "nokey",
                "-show_entries", "frame=best_effort_timestamp_time",
@@ -876,21 +922,23 @@ class SqueezerCore(QObject):
         try:
             out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL,
                                           creationflags=CREATION_FLAGS,
-                                          timeout=30).decode()
+                                          timeout=60).decode()
             key_times = [float(x) for x in out.split()]
         except Exception as e:
             logging.error(f"Не удалось получить keyframes для проверки точности copy: {e}")
             return False
-        if not key_times:
-            return False
-        # первый keyframe на или после выбранного кадра
-        target_sec = start_f / fps
-        for kt in key_times:
-            if kt >= target_sec - (0.5 / max(fps, 1.0)):
-                # совпадает ли он ровно с выбранным кадром?
-                kf_frame = int(round(kt * fps))
-                return abs(kf_frame - start_f) <= 0
-        return False
+        result = False
+        if key_times:
+            # первый keyframe на или после выбранного кадра
+            target_sec = start_f / fps
+            for kt in key_times:
+                if kt >= target_sec - (0.5 / max(fps, 1.0)):
+                    # совпадает ли он ровно с выбранным кадром?
+                    kf_frame = int(round(kt * fps))
+                    result = (kf_frame == start_f)
+                    break
+        self.app._keyframe_cache[cache_key] = result
+        return result
 
     def calculate_bitrate(self, row, strict_limit, target_size_gb, global_val):
         if row not in self.app.queue_data:
@@ -989,6 +1037,77 @@ class SqueezerCore(QObject):
             self._nvenc_cache = False
         return self._nvenc_cache
 
+    def _launch_copy(self, row, data, out):
+        """Запуск ffmpeg в режиме -c copy (быстрая переупаковка без перекодирования)."""
+        args = [FFMPEG_EXE, "-y",
+                "-ss", f"{data['start']:.6f}",
+                "-to", f"{data['end']:.6f}",
+                "-i", data["path"],
+                "-c", "copy", "-movflags", "+faststart", out]
+        logging.info("Битрейт не задан (в лимите) — копирование без перекодирования "
+                     "(границы совпадают с ключевыми кадрами).")
+        self.start_time = time.time()
+        try:
+            self.ffmpeg_proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE,
+                                                creationflags=CREATION_FLAGS,
+                                                cwd=EXE_DIR_SHORT)
+        except Exception as e:
+            logging.error(f"Не удалось запустить FFmpeg (copy): {e}")
+            self.encode_failed.emit(row)
+            return False
+        self._progress_thread = threading.Thread(target=self._read_ffmpeg_progress,
+                                                 args=(row,), daemon=True)
+        self._progress_thread.start()
+        return True
+
+    def _start_copy_or_encode(self, row, data, out):
+        """
+        Решает, можно ли для строки использовать быстрое копирование.
+        Возвращает True, если КОПИРОВАНИЕ уже запущено либо старт отложен
+        до завершения фоновой проверки keyframes (дальше код не идёт).
+        Возвращает False, если нужна обычная перекодировка (trim-фильтры).
+        Никогда не блокирует GUI: долгий ffprobe выполняется в QThread,
+        а после его завершения перекодировка запускается через сигнал.
+        """
+        crop_active = bool(data.get("crop_area") and data["crop_area"].strip())
+        res_active = bool(data.get("target_res") and data["target_res"] != "Оригинал")
+        if data.get("bitrate") is not None or crop_active or res_active:
+            return False  # перекодировка обязательна — идём дальше по run_ffmpeg_process
+        cache_key = (data["path"], int(round(max(0.0, data["start"]) * self.get_video_fps(data["path"]))))
+        cached = self.app._keyframe_cache.get(cache_key)
+        if cached is True:
+            return self._launch_copy(row, data, out)
+        if cached is False:
+            return False  # copy съел бы кадр — перекодируем поточно-точно
+        # Результата ещё нет — запускаем ФОНОВУЮ проверку, GUI не виснет
+        status_item = self.app.table.item(row, 4)
+        if status_item:
+            status_item.setText("Проверка кадров...")
+        check = KeyframeCheckThread(self, row, data, parent=self.app)
+        check.result_ready.connect(lambda r, acc: self._on_keyframe_check_done(r, acc, out))
+        self.app._keyframe_checks.append(check)
+        check.finished.connect(lambda c=check: self._drop_keyframe_check(c))
+        check.start()
+        return True
+
+    def _drop_keyframe_check(self, check):
+        try:
+            self.app._keyframe_checks.remove(check)
+        except ValueError:
+            pass
+
+    def _on_keyframe_check_done(self, row, accurate, out):
+        """Продолжение запуска строки после фоновой проверки keyframes."""
+        if self.stop_requested or row not in self.app.queue_data:
+            return
+        data = self.app.queue_data[row]
+        if accurate:
+            self._launch_copy(row, data, out)
+        else:
+            # copy начался бы не с выбранного кадра — перекодируем точно по кадрам
+            self.run_ffmpeg_process(row, self.app.custom_save_dir)
+
     def run_ffmpeg_process(self, row, custom_save_dir):
         try:
             if self.stop_requested:
@@ -1016,30 +1135,11 @@ class SqueezerCore(QObject):
             # по ключевым кадрам, поэтому перед копированием проверяем, что
             # ближайший keyframe не «съедает» выбранный начальный кадр. Если
             # съедает — молча переходим на перекодировку (она покадрово точна).
-            if data.get("bitrate") is None and not data.get("crop_area") \
-                    and (not data.get("target_res") or data["target_res"] == "Оригинал") \
-                    and self._copy_trim_is_frame_accurate(data):
-                args = [FFMPEG_EXE, "-y",
-                        "-ss", f"{data['start']:.6f}",
-                        "-to", f"{data['end']:.6f}",
-                        "-i", data["path"],
-                        "-c", "copy", "-movflags", "+faststart", out]
-                logging.info("Битрейт не задан (в лимите) — копирование без перекодирования "
-                             "(границы совпадают с ключевыми кадрами).")
-                self.start_time = time.time()
-                try:
-                    self.ffmpeg_proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                                        stderr=subprocess.PIPE,
-                                                        creationflags=CREATION_FLAGS,
-                                                        cwd=EXE_DIR_SHORT)
-                except Exception as e:
-                    logging.error(f"Не удалось запустить FFmpeg (copy): {e}")
-                    self.encode_failed.emit(row)
-                    return False
-                self._progress_thread = threading.Thread(target=self._read_ffmpeg_progress,
-                                                         args=(row,), daemon=True)
-                self._progress_thread.start()
-                return True
+            # Проверка keyframes может длиться десятки секунд, поэтому она
+            # фоновая (см. _start_copy_or_encode) — здесь используем только
+            # готовый закешированный результат, GUI никогда не блокируется.
+            if self._start_copy_or_encode(row, data, out):
+                return True  # запущено копирование ИЛИ отложен старт после проверки
 
             vf_filters = []
             # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ТОЧНОСТИ ОБРЕЗКИ ПРИ ПЕРЕКОДИРОВАНИИ:
@@ -1262,6 +1362,10 @@ class GpuSqueezerApp(QMainWindow):
 
         self.queue_data = {}
         self.current_encoding_row = -1
+        # Кэш проверки keyframes (путь, стартовый кадр) -> bool: copy точен или нет.
+        # Заполняется ФОНОВЫМ потоком KeyframeCheckThread — GUI не блокируется.
+        self._keyframe_cache = {}
+        self._keyframe_checks = []  # живые фоновые проверки (удержание ссылок)
         self.last_output_dir = os.path.expanduser("~")
         self.custom_save_dir = ""
         self.current_output_file = ""
@@ -1452,8 +1556,46 @@ class GpuSqueezerApp(QMainWindow):
         for row in range(self.table.rowCount()):
             self._recalculate_row_safely(row)
 
+        # Фоновая «прогревка» проверки keyframes для новых строк: долгий
+        # ffprobe запускается в QThread и кэшируется, поэтому ни добавление
+        # файлов, ни последующий запуск очереди не блокируют GUI и проводник.
+        for row in list(self.queue_data.keys()):
+            self._prefetch_keyframe_check(row)
+
         if was_empty and self.table.rowCount() > 0:
             self.table.setCurrentCell(0, 0)
+
+    def _prefetch_keyframe_check(self, row):
+        """Запускает проверку точности copy-обрезки в фоне (без блокировки)."""
+        data = self.queue_data.get(row)
+        if not data:
+            return
+        crop_active = bool(data.get("crop_area") and data["crop_area"].strip())
+        res_active = bool(data.get("target_res") and data["target_res"] != "Оригинал")
+        if data.get("bitrate") is not None or crop_active or res_active:
+            return  # перекодировка всё равно нужна — проверять бессмысленно
+        try:
+            fps = self.core.get_video_fps(data["path"])
+        except Exception:
+            return
+        cache_key = (data["path"], int(round(max(0.0, data["start"]) * fps)))
+        if cache_key in self._keyframe_cache:
+            return
+        check = KeyframeCheckThread(self.core, row, data, parent=self)
+        # Ключ кэша фиксируем сразу (path+стартовый кадр), чтобы результат
+        # попал ровно под тот ключ, который читает _start_copy_or_encode.
+        def _store(key, r, acc):
+            self._keyframe_cache[key] = acc
+        check.result_ready.connect(lambda r, acc, key=cache_key: _store(key, r, acc))
+        self._keyframe_checks.append(check)
+        check.finished.connect(lambda c=check: self._drop_check(c))
+        check.start()
+
+    def _drop_check(self, check):
+        try:
+            self._keyframe_checks.remove(check)
+        except ValueError:
+            pass
 
     def _recalculate_row_safely(self, row):
         if row not in self.queue_data:
@@ -1710,6 +1852,15 @@ class GpuSqueezerApp(QMainWindow):
                 t.join(timeout=3)
         except Exception:
             pass
+
+        # Ждём завершения фоновых проверок keyframes (иначе QThread может
+        # быть уничтожен на середине работы — предупреждения/вылеты при выходе)
+        for c in list(self._keyframe_checks):
+            try:
+                c.requestInterruption()
+                c.wait(2000)
+            except Exception:
+                pass
 
         event.accept()
 
