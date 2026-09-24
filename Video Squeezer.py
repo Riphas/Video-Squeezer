@@ -927,15 +927,18 @@ class SqueezerCore(QObject):
         except Exception as e:
             logging.error(f"Не удалось получить keyframes для проверки точности copy: {e}")
             return False
+        # ИСПРАВЛЕНИЕ ТОЧНОСТИ ПРИ COPY: ffmpeg с -ss ДО -i ищет ближайший
+        # ключевой кадр НЕ ПОЗЖЕ указанной позиции (откат назад). Поэтому
+        # копирование начнётся ровно с выбранного кадра ТОЛЬКО если сам этот
+        # кадр является keyframe-ом. Раньше проверялся «первый keyframe на или
+        # после» — из-за чего copy мог стартануть раньше выбранного кадра.
         result = False
         if key_times:
-            # первый keyframe на или после выбранного кадра
             target_sec = start_f / fps
+            half = 0.5 / max(fps, 1.0)
             for kt in key_times:
-                if kt >= target_sec - (0.5 / max(fps, 1.0)):
-                    # совпадает ли он ровно с выбранным кадром?
-                    kf_frame = int(round(kt * fps))
-                    result = (kf_frame == start_f)
+                if abs(kt - target_sec) <= half:
+                    result = (int(round(kt * fps)) == start_f)
                     break
         self.app._keyframe_cache[cache_key] = result
         return result
@@ -986,7 +989,10 @@ class SqueezerCore(QObject):
             # НЕ повышаем битрейт искусственно: оставляем родной.
             # (Копирование без перекодирования применяется только когда не
             # заданы кроп/изменение разрешения — иначе фильтр требует перекодировки.)
-            if source_total_bitrate > 0 and source_total_bitrate * duration <= target_size_gb * 0.95 * 1024 * 1024 * 1024 * 8:
+            # ЕДИНИЦЫ: source_total_bitrate в кбит/с, duration в секундах ->
+            # размер в битах = kbit*1000*s; лимит в ГБ переводим в байты и *8.
+            limit_bits = target_size_gb * 0.95 * 1024 * 1024 * 1024 * 8
+            if source_total_bitrate > 0 and source_total_bitrate * 1000 * duration <= limit_bits:
                 crop_active = data.get("crop_area") and data["crop_area"].strip() not in ("", " ")
                 res_active = data.get("target_res") and data["target_res"] != "Оригинал"
                 if not crop_active and not res_active:
@@ -996,14 +1002,18 @@ class SqueezerCore(QObject):
                 return video_bitrate, status_text
 
             # Ролик тяжелее лимита — считаем видеобитрейт под лимит
-            # Запас 5%
-            safe_target_gb = max(0.05, target_size_gb * 0.95)
+            # (запас 5%). ВАЖНО: floor берём от ФАКТИЧЕСКОГО лимита, а не от
+            # значения с запасом — иначе на очень маленьких лимитах расчётный
+            # битрейт мог оказаться ВЫШЕ родного и файл раздувало обратно
+            # до границы лимита (искусственное завышение битрейта).
+            safe_target_gb = target_size_gb * 0.95
             target_bits = safe_target_gb * 1024 * 1024 * 1024 * 8
             # Правильный расчет: вычитаем аудио (128 кб/с)
             audio_bits_total = 128000 * duration
             video_bits_available = target_bits - audio_bits_total
             calculated_video_bitrate = int(video_bits_available / 1000 / duration)
-            calculated_video_bitrate = max(100, calculated_video_bitrate)
+            min_floor_bits = int(max(0.0, target_size_gb * 1024**3 * 8 - 128000 * duration) / 1000 / duration)
+            calculated_video_bitrate = max(1, min(100, min_floor_bits), calculated_video_bitrate)
 
             if source_bitrate > 0 and calculated_video_bitrate >= source_bitrate:
                 # ИСПРАВЛЕНИЕ: ролик с родным битрейтом весит МЕНЬШЕ лимита —
@@ -1238,10 +1248,28 @@ class SqueezerCore(QObject):
                             "-maxrate", f"{data['bitrate']}k", "-bufsize", f"{data['bitrate'] * 2}k",
                             "-preset", "medium"])
 
-            # Обрезка аудио точно по тем же границам (видео режется фильтром
-            # trim, аудио — отдельными флагами, чтобы не было рассинхрона)
-            args.extend(["-ss", f"{data['start']:.6f}", "-to", f"{data['end']:.6f}",
-                         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out])
+            # ИСПРАВЛЕНИЕ «СБОЙ» (рассинхрон/обрезанное аудио): раньше -ss/-to
+            # стояли ПОСЛЕ -i (т.е. применялись к ВЫХОДУ). Видео при этом уже
+            # было обрезано фильтром trim и его PTS начинается с нуля, поэтому
+            # выходной -ss отсекал ещё start секунд ЗВУКА (или обрывал трек).
+            # Теперь аудио резуется тем же механизмом фильтров: atrim по
+            # временным границам + asetpts=PTS-STARTPTS — звук начинается
+            # ровно там же, где и видео. ПРИМЕЧАНИЕ: atrim НЕ поддерживает
+            # start_frame/end_frame (в отличие от trim) — проверено на ffmpeg
+            # 5.x, поэтому для аудио используются секунды start/end.
+            # Если видеопотока нет вообще (trim неприменим), обрезается и
+            # видео, и аудио через -ss/-to ДО -i (быстрый точный поиск входных
+            # пакетов для аудио-контейнеров корректен).
+            if has_video:
+                a_trim = (f"atrim=start={max(0.0, data['start']):.6f}:"
+                          f"end={max(0.0, data['end']):.6f},asetpts=PTS-STARTPTS")
+                args.extend(["-c:a", "aac", "-b:a", "128k",
+                             "-af", a_trim, "-movflags", "+faststart", out])
+            else:
+                args.extend(["-ss", f"{max(0.0, data['start']):.6f}",
+                             "-to", f"{max(0.0, data['end']):.6f}",
+                             "-c:a", "aac", "-b:a", "128k",
+                             "-movflags", "+faststart", out])
 
             logging.info(f"Запуск FFmpeg:")
             logging.info(f"  FFMPEG_EXE: {FFMPEG_EXE}")
@@ -1726,7 +1754,7 @@ class GpuSqueezerApp(QMainWindow):
         self.current_output_file = ""
         if self.core.stop_requested:
             return
-        self.table.setItem(row, 4, QTableWidgetItem(" Сбой"))
+        self.table.setItem(row, 4, QTableWidgetItem("✗ Сбой"))
         self.encode_next()
 
     def recalculate_current_row(self):
@@ -1739,7 +1767,7 @@ class GpuSqueezerApp(QMainWindow):
             self.queue_data[row]["target_res"] = selected_res
             self._recalculate_row_safely(row)
             current_status = self.table.item(row, 4).text() if self.table.item(row, 4) else "В очереди"
-            if current_status not in ["Сжатие...", "✓ Готово", " Ошибка", "✗ Сбой"]:
+            if current_status not in ["Сжатие...", "✓ Готово", "✗ Ошибка", "✗ Сбой"]:
                 self.table.setItem(row, 4, QTableWidgetItem(f"Разрешение: {selected_res}"))
 
     def apply_resolution_to_all(self):
