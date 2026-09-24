@@ -946,6 +946,16 @@ class SqueezerCore(QObject):
         data = self.app.queue_data[row]
         duration = data["end"] - data["start"]
         if duration <= 0:
+            # ИСПРАВЛЕНИЕ «СБОЙ»: раньше при нулевой длительности функция
+            # молча возвращала None — битрейт оставался со значением по
+            # умолчанию, а ffmpeg падал на пустом фрагменте. Теперь это явная
+            # ошибка строки с понятным статусом в таблице.
+            logging.error(f"Строка {row}: нулевая длительность отрезка "
+                          f"(start={data['start']}, end={data['end']})")
+            try:
+                self.app.table.setItem(row, 4, QTableWidgetItem("✗ Пустой отрезок"))
+            except Exception:
+                pass
             return None
 
         # "Родной" битрейт источника (кб/с) — нужен для проверки лимита размера
@@ -1039,9 +1049,24 @@ class SqueezerCore(QObject):
 
     def _launch_copy(self, row, data, out):
         """Запуск ffmpeg в режиме -c copy (быстрая переупаковка без перекодирования)."""
+        # ИСПРАВЛЕНИЕ «СБОЙ»: границы режем ПО КАДРАМ (как в trim-режиме),
+        # а не секундами с точностью до миллиметра. При -c copy ffmpeg оставляет
+        # кадры с PTS >= time(границы); из-за округления времени в float
+        # (секунды->кадры->секунды) выбранный кадр мог оказаться на наносекунду
+        # РАНЬШЕ границы и отбрасываться — начало ролика съезжало на кадр.
+        # Сдвиг границы на полкадра назад гарантирует попадание нужного кадра
+        # и не захватывает лишнего (предыдущий кадр минимум на 1/fps раньше).
+        fps = self.get_video_fps(data["path"])
+        start_f = int(round(max(0.0, data["start"]) * fps))
+        end_f = int(round(max(0.0, data["end"]) * fps))
+        if end_f <= start_f:
+            end_f = start_f + 1
+        half = 0.5 / max(fps, 1e-6)
+        ss_val = max(0.0, start_f / fps - half)
+        to_val = end_f / fps + half
         args = [FFMPEG_EXE, "-y",
-                "-ss", f"{data['start']:.6f}",
-                "-to", f"{data['end']:.6f}",
+                "-ss", f"{ss_val:.6f}",
+                "-to", f"{to_val:.6f}",
                 "-i", data["path"],
                 "-c", "copy", "-movflags", "+faststart", out]
         logging.info("Битрейт не задан (в лимите) — копирование без перекодирования "
@@ -1147,11 +1172,30 @@ class SqueezerCore(QObject):
             # аппаратном ускорении могут откатываться до ближайшего keyframe)
             # используем покадровый фильтр trim — он вырезает РОВНО кадры
             # start_frame..end_frame, выбранные ползунком.
-            trimspec = self._frame_accurate_trimspec(data)
-            logging.info(f"Точная обрезка по кадрам: trim={trimspec} "
-                         f"(fps={self.get_video_fps(data['path'])})")
-            vf_filters.append(f"trim={trimspec}")
-            vf_filters.append("setpts=PTS-STARTPTS")
+            # ИСПРАВЛЕНИЕ «СБОЙ»: ffmpeg 5.x понимает start_frame/end_frame в
+            # trim ТОЛЬКО для видео-потока. Если входной файл вообще без видео
+            # (или ffprobe не вернул видео-поток), фильтр падает с
+            # "Option start_frame ... not found" и вся строка получает статус
+            # «Сбой». Для аудио-только файлов обрезку делает -ss/-to ниже.
+            has_video = False
+            try:
+                vchk = subprocess.run(
+                    [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=index",
+                     "-of", "default=noprint_wrappers=1:nokey=1", data["path"]],
+                    capture_output=True, creationflags=CREATION_FLAGS, timeout=15)
+                has_video = bool(vchk.stdout.decode(errors="ignore").strip())
+            except Exception:
+                has_video = True  # не смогли проверить — поступаем как раньше
+
+            if has_video:
+                trimspec = self._frame_accurate_trimspec(data)
+                logging.info(f"Точная обрезка по кадрам: trim={trimspec} "
+                             f"(fps={self.get_video_fps(data['path'])})")
+                vf_filters.append(f"trim={trimspec}")
+                vf_filters.append("setpts=PTS-STARTPTS")
+            else:
+                logging.info("Видеопоток отсутствует — обрезка только по времени (-ss/-to)")
             if data.get("crop_area") and data["crop_area"] != " ":
                 vf_filters.append(f"crop={data['crop_area']}")
             if data.get("target_res") and data["target_res"] != "Оригинал":
@@ -1642,7 +1686,35 @@ class GpuSqueezerApp(QMainWindow):
                 pbar.setValue(100)
             self.table.setItem(row, 4, QTableWidgetItem("✓ Готово"))
         else:
-            self.table.setItem(row, 4, QTableWidgetItem("✗ Ошибка"))
+            # ИСПРАВЛЕНИЕ «СБОЙ»: показываем причину падения ffmpeg прямо в
+            # статусе строки (раньше было просто "✗ Ошибка" без объяснений).
+            reason = ""
+            try:
+                proc = getattr(self.core, "ffmpeg_proc", None)
+                if proc is not None and proc.stderr is not None:
+                    tail = b""
+                    try:
+                        while True:
+                            chunk = proc.stderr.read(2048)
+                            if not chunk:
+                                break
+                            tail = chunk[-4096:] if len(chunk) >= 4096 else (tail + chunk)[-4096:]
+                    except Exception:
+                        pass
+                    lines = [l.strip() for l in tail.decode(errors="ignore").splitlines() if l.strip()]
+                    for l in reversed(lines):
+                        low = l.lower()
+                        if ("error" in low or "invalid" in low or "not found" in low
+                                or "no such" in low or "failed" in low or "permission" in low):
+                            reason = l[:120]
+                            break
+            except Exception:
+                pass
+            status = f"✗ Ошибка кодом {exit_code}"
+            if reason:
+                status += f": {reason}"
+            logging.error(f"FFmpeg завершился с ошибкой (код {exit_code}): {reason or 'причина не распознана'}")
+            self.table.setItem(row, 4, QTableWidgetItem(status))
             # При ошибке очищаем путь, чтобы stop_process не удалил что-то лишнее
             self.current_output_file = ""
 
