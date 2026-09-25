@@ -6,6 +6,7 @@ CachyOS GPU Squeezer - Видео конвертер с аппаратным у�
 """
 import os
 import sys
+import io
 import stat
 import shutil
 import zipfile
@@ -38,6 +39,17 @@ def get_exe_dir():
 
 EXE_DIR = get_exe_dir()
 CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+if sys.platform == "win32":
+    # Стартовый блок Windows: скрываем консоль ДО импорта PyQt и любых проверок,
+    # чтобы окно консоли не мелькало даже на долю секунды. Полный перезапуск
+    # без консоли выполняется позже в main() (_relaunch_without_console).
+    try:
+        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if _hwnd:
+            ctypes.windll.kernel32.ShowWindow(_hwnd, 0)  # SW_HIDE
+    except BaseException:
+        pass
 
 # ============================================================================
 # АВТОМАТИЧЕСКОЕ СКАЧИВАНИЕ НЕДОСТАЮЩИХ КОМПОНЕНТОВ (ffmpeg / ffprobe)
@@ -1554,32 +1566,182 @@ def _apply_runtime_paths():
     logging.info(f"Обновлённые пути: FFMPEG_EXE={FFMPEG_EXE}, FFPROBE_EXE={FFPROBE_EXE}")
 
 
+def _silence_console_streams():
+    """Заменяет sys.stdout/sys.stderr на заглушки, если консоли нет (pythonw)
+    или они битые после перезапуска процесса. Все логи пишутся в файл
+    (logging.basicConfig с filename), поэтому вывод в консоль не нужен."""
+    class _NullStream:
+        encoding = "utf-8"
+        errors = "replace"
+
+        def write(self, *a, **k):
+            return 0
+
+        def writelines(self, *a, **k):
+            return None
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            raise io.UnsupportedOperation("stdout redirected to null")
+
+        @property
+        def closed(self):
+            return False
+
+    if sys.stdout is None:
+        sys.stdout = _NullStream()
+    if sys.stderr is None:
+        sys.stderr = _NullStream()
+
+
+def _hide_windows_console():
+    """Подстраховка: скрывает окно консоли текущего процесса на Windows.
+    FreeConsole() вызывать нельзя, пока в stdout/stderr пишут C-библиотеки
+    (ffmpeg-вызовы через subprocess наследуют handles) — поэтому только
+    ShowWindow(SW_HIDE)."""
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            kernel32.ShowWindow(hwnd, 0)   # SW_HIDE
+    except Exception as e:
+        logging.warning(f"Не удалось скрыть консоль: {e}")
+
+
+def _find_launcher():
+    """Возвращает путь к интерпретатору БЕЗ консоли (pythonw.exe) для запуска
+    скрипта. Если он найден — перезапуск через него вообще не создаёт окна
+    консоли. Иначе возвращает None (тогда используется fallback-релaunch)."""
+    exe_path = sys.executable or ""
+    if not exe_path or getattr(sys, 'frozen', False):
+        return None
+    exe_dir = os.path.dirname(exe_path)
+    candidates = [os.path.join(exe_dir, "pythonw.exe")]
+    parent = os.path.dirname(exe_dir)
+    if os.path.basename(exe_dir).lower() in ("scripts", "bin"):
+        # venv: .../Scripts/python.exe -> базовый Python312/pythonw.exe
+        candidates.append(os.path.join(parent, "pythonw.exe"))
+        candidates.append(os.path.join(parent, "Scripts", "pythonw.exe"))
+    found = shutil.which("pythonw")
+    if found:
+        candidates.append(found)
+    return next((c for c in candidates if c and os.path.exists(c)), None)
+
+
+def _spawn_hidden(cmdline, env=None):
+    """Запуск процесса на Windows ТАК, чтобы окно консоли даже не мелькало:
+    STARTUPINFO(SW_HIDE) + CREATE_NO_WINDOW.
+    cmdline — командная строка в формате CreateProcessW. Возвращает True при успехе."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE — окно не показывается вообще
+    kwargs = dict(startupinfo=si, env=env, stdin=subprocess.DEVNULL,
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  close_fds=True)
+    try:
+        subprocess.Popen(cmdline, creationflags=subprocess.CREATE_NO_WINDOW, **kwargs)
+        return True
+    except (OSError, ValueError):
+        # Старые Windows без поддержки CREATE_NO_WINDOW — только SW_HIDE
+        try:
+            subprocess.Popen(cmdline, **kwargs)
+            return True
+        except OSError:
+            return False
+
+
+def _quote_arg(arg):
+    """Экранирование аргумента для командной строки CreateProcessW (правила MSVCRT)."""
+    arg = str(arg)
+    if arg and not re.search(r'[\s"^]', arg):
+        return arg
+    out, backslashes = [], 0
+    for ch in arg:
+        if ch == '\\':
+            backslashes += 1
+            continue
+        if ch == '"':
+            out.append('\\' * (backslashes * 2 + 1))
+            out.append('"')
+        else:
+            out.append('\\' * backslashes)
+            out.append(ch)
+        backslashes = 0
+    out.append('\\' * (backslashes * 2))
+    return '"' + ''.join(out) + '"'
+
+
+def _relaunch_without_console():
+    """Windows: если процесс запущен с окном консоли (двойной клик по .py,
+    python.exe из cmd/проводника), перезапускаем его так, чтобы консоль
+    НЕ появлялась вообще:
+    - основной путь: запуск скрипта через pythonw.exe (GUI-интерпретатор,
+      консольное окно у него не создаётся никогда);
+    - fallback (для собранного windowed-EXE): перезапуск самого себя с
+      STARTUPINFO(SW_HIDE)+CREATE_NO_WINDOW;
+    - защита от цикла: переменная окружения VIDEOSQUEEZER_RELAUNCHED=1."""
+    if sys.platform != "win32":
+        return
+    if os.environ.get("VIDEOSQUEEZER_RELAUNCHED") == "1":
+        return  # мы уже перезапущенный процесс — иначе будет бесконечный цикл
+    try:
+        kernel32 = ctypes.windll.kernel32
+        hwnd = kernel32.GetConsoleWindow()
+        if not hwnd:
+            return  # консоли и так нет (pythonw / .pyw / --windowed EXE)
+        env = os.environ.copy()
+        env["VIDEOSQUEEZER_RELAUNCHED"] = "1"
+        pythonw = _find_launcher()
+        if pythonw is not None:
+            # pythonw.exe: процесс вообще не имеет консоли — окно не появится
+            cmdline = " ".join([_quote_arg(pythonw),
+                                _quote_arg(os.path.abspath(__file__))]
+                               + [_quote_arg(a) for a in sys.argv[1:]])
+            if _spawn_hidden(cmdline, env):
+                os._exit(0)  # завершаем старый процесс СРАЗУ, не дожидаясь GUI
+        elif getattr(sys, 'frozen', False):
+            # Windowed-EXE: пересоздаём себя без видимой консоли
+            cmdline = " ".join([_quote_arg(sys.executable)]
+                               + [_quote_arg(a) for a in sys.argv[1:]])
+            if _spawn_hidden(cmdline, env):
+                os._exit(0)
+        # Не удалось перезапуститься (нет pythonw / отказ CreateProcess) —
+        # минимум: скрываем существующее окно консоли и работаем дальше.
+        kernel32.ShowWindow(hwnd, 0)  # SW_HIDE
+        logging.info("Перезапуск без консоли недоступен — консоль скрыта (SW_HIDE).")
+    except SystemExit:
+        raise
+    except BaseException as e:
+        logging.warning(f"Перезапуск без консоли не удался ({e}), "
+                        "продолжаем в текущем процессе.")
+
+
 def main():
     """
     Старт приложения без консоли единым окном:
-    - .pyw / pythonw или PyInstaller (--windowed/--noconsole) консоль уже отсутствует;
-    - при запуске из обычной консоли на Windows процесс перезапускается через
-      pythonw detached-режимом, чтобы было только одно окно без чёрного окна.
+    - при запуске на Windows, если у процесса есть окно консоли (python.exe,
+      двойной клик по .py, запуск из cmd/PowerShell), процесс перезапускается
+      через pythonw.exe с флагом DETACHED_PROCESS — новая консоль не создаётся,
+      исходное окно консоли закрывается вместе с завершением старого процесса;
+    - если консоль принадлежит внешнему терминалу (cmd/PowerShell) и закрыть
+      её нельзя, она скрывается через ShowWindow(SW_HIDE);
+    - потоки stdout/stderr подменяются заглушками, чтобы случайный print()
+      не ронял приложение при отсутствии консоли (весь лог идёт в файл);
+    - дочерние процессы (ffmpeg/ffprobe/taskkill/nvidia-smi) запускаются с
+      subprocess.CREATE_NO_WINDOW и перенаправленным выводом, поэтому их
+      консоли не мелькают.
     Также при старте автоматически скачиваются недостающие компоненты (ffmpeg/ffprobe).
     """
-    if sys.platform == "win32" and not getattr(sys, 'frozen', False) \
-            and not os.environ.get("SQUEEZER_NO_CONSOLE"):
-        try:
-            if sys.stdout is None or sys.stderr is None:
-                # Уже запущены через pythonw — консоли нет
-                os.environ["SQUEEZER_NO_CONSOLE"] = "1"
-            else:
-                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-                if os.path.exists(pythonw):
-                    os.environ["SQUEEZER_NO_CONSOLE"] = "1"
-                    DETACHED = 0x00000008 | 0x00000010  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                    subprocess.Popen([pythonw] + sys.argv, creationflags=DETACHED,
-                                     close_fds=True)
-                    sys.exit(0)
-        except SystemExit:
-            raise
-        except Exception as e:
-            logging.warning(f"Перезапуск без консоли не удался ({e}), продолжаем в текущем процессе.")
+    _relaunch_without_console()   # перечитывает env VIDEOSQUEEZER_NO_CONSOLE
+    _silence_console_streams()
+    _hide_windows_console()       # финальная подстраховка перед показом GUI
 
     app = QApplication(sys.argv)
 
