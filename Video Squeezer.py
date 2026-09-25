@@ -40,6 +40,17 @@ def get_exe_dir():
 EXE_DIR = get_exe_dir()
 CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+if sys.platform == "win32":
+    # Стартовый блок Windows: скрываем консоль ДО импорта PyQt и любых проверок,
+    # чтобы окно консоли не мелькало даже на долю секунды. Полный перезапуск
+    # без консоли выполняется позже в main() (_relaunch_without_console).
+    try:
+        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if _hwnd:
+            ctypes.windll.kernel32.ShowWindow(_hwnd, 0)  # SW_HIDE
+    except BaseException:
+        pass
+
 # ============================================================================
 # АВТОМАТИЧЕСКОЕ СКАЧИВАНИЕ НЕДОСТАЮЩИХ КОМПОНЕНТОВ (ffmpeg / ffprobe)
 # ============================================================================
@@ -1604,72 +1615,110 @@ def _hide_windows_console():
         logging.warning(f"Не удалось скрыть консоль: {e}")
 
 
-def _run_detached_pythonw(script_argv):
-    """Запускает скрипт через pythonw.exe полностью отсоединённым процессом
-    (DETACHED_PROCESS — новая консоль НЕ создаётся). Возвращает объект Popen."""
-    candidates = []
+def _find_launcher():
+    """Возвращает путь к интерпретатору БЕЗ консоли (pythonw.exe) для запуска
+    скрипта. Если он найден — перезапуск через него вообще не создаёт окна
+    консоли. Иначе возвращает None (тогда используется fallback-релaunch)."""
     exe_path = sys.executable or ""
-    if exe_path:
-        exe_dir = os.path.dirname(exe_path)
-        base = os.path.basename(exe_dir)
-        if base.lower() in ("python", "python3"):
-            # .../Python312/python.exe -> .../Python312/pythonw.exe
-            candidates.append(os.path.join(os.path.dirname(exe_dir), "pythonw.exe"))
-        else:
-            # .../Scripts/python.exe -> .../Python312/pythonw.exe
-            candidates.append(os.path.join(os.path.dirname(exe_dir), "pythonw.exe"))
-        candidates.append(os.path.join(exe_dir, "pythonw.exe"))
+    if not exe_path or getattr(sys, 'frozen', False):
+        return None
+    exe_dir = os.path.dirname(exe_path)
+    candidates = [os.path.join(exe_dir, "pythonw.exe")]
+    parent = os.path.dirname(exe_dir)
+    if os.path.basename(exe_dir).lower() in ("scripts", "bin"):
+        # venv: .../Scripts/python.exe -> базовый Python312/pythonw.exe
+        candidates.append(os.path.join(parent, "pythonw.exe"))
+        candidates.append(os.path.join(parent, "Scripts", "pythonw.exe"))
     found = shutil.which("pythonw")
     if found:
         candidates.append(found)
-    pythonw = next((c for c in candidates if c and os.path.exists(c)), None)
-    if pythonw is None:
-        raise FileNotFoundError("pythonw.exe не найден рядом с "
-                                f"{exe_path!r} и отсутствует в PATH")
-    env = os.environ.copy()
-    env["VIDEOSQUEEZER_NO_CONSOLE"] = "1"
-    DETACHED_PROCESS = 0x00000008          # дочерний процесс БЕЗ консоли
-    CREATE_NEW_PROCESS_GROUP = 0x00000200
-    return subprocess.Popen([pythonw] + script_argv, env=env, cwd=os.getcwd(),
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                            close_fds=True)
+    return next((c for c in candidates if c and os.path.exists(c)), None)
+
+
+def _spawn_hidden(cmdline, env=None):
+    """Запуск процесса на Windows ТАК, чтобы окно консоли даже не мелькало:
+    STARTUPINFO(SW_HIDE) + CREATE_NO_WINDOW.
+    cmdline — командная строка в формате CreateProcessW. Возвращает True при успехе."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE — окно не показывается вообще
+    kwargs = dict(startupinfo=si, env=env, stdin=subprocess.DEVNULL,
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  close_fds=True)
+    try:
+        subprocess.Popen(cmdline, creationflags=subprocess.CREATE_NO_WINDOW, **kwargs)
+        return True
+    except (OSError, ValueError):
+        # Старые Windows без поддержки CREATE_NO_WINDOW — только SW_HIDE
+        try:
+            subprocess.Popen(cmdline, **kwargs)
+            return True
+        except OSError:
+            return False
+
+
+def _quote_arg(arg):
+    """Экранирование аргумента для командной строки CreateProcessW (правила MSVCRT)."""
+    arg = str(arg)
+    if arg and not re.search(r'[\s"^]', arg):
+        return arg
+    out, backslashes = [], 0
+    for ch in arg:
+        if ch == '\\':
+            backslashes += 1
+            continue
+        if ch == '"':
+            out.append('\\' * (backslashes * 2 + 1))
+            out.append('"')
+        else:
+            out.append('\\' * backslashes)
+            out.append(ch)
+        backslashes = 0
+    out.append('\\' * (backslashes * 2))
+    return '"' + ''.join(out) + '"'
 
 
 def _relaunch_without_console():
-    """Windows: если появилось окно консоли (запуск двойным кликом по .py,
-    из cmd/PowerShell или проводником через python.exe), перезапускаем себя
-    отсоединённым процессом БЕЗ консоли. Для собранного EXE используется
-    релaunch самого EXE с флагом DETACHED_PROCESS (он уже windowed-режима)."""
+    """Windows: если процесс запущен с окном консоли (двойной клик по .py,
+    python.exe из cmd/проводника), перезапускаем его так, чтобы консоль
+    НЕ появлялась вообще:
+    - основной путь: запуск скрипта через pythonw.exe (GUI-интерпретатор,
+      консольное окно у него не создаётся никогда);
+    - fallback (для собранного windowed-EXE): перезапуск самого себя с
+      STARTUPINFO(SW_HIDE)+CREATE_NO_WINDOW;
+    - защита от цикла: переменная окружения VIDEOSQUEEZER_RELAUNCHED=1."""
     if sys.platform != "win32":
         return
-    if os.environ.get("VIDEOSQUEEZER_NO_CONSOLE") == "1":
+    if os.environ.get("VIDEOSQUEEZER_RELAUNCHED") == "1":
         return  # мы уже перезапущенный процесс — иначе будет бесконечный цикл
     try:
         kernel32 = ctypes.windll.kernel32
         hwnd = kernel32.GetConsoleWindow()
         if not hwnd:
             return  # консоли и так нет (pythonw / .pyw / --windowed EXE)
-        attached = kernel32.AttachConsole(kernel32.INVALID_HANDLE_VALUE)
-        if attached:
-            # Консоль принадлежит другому процессу (cmd/PowerShell/проводник) —
-            # свою закрывать нельзя, просто скрываем и продолжаем работу.
-            kernel32.FreeConsole()
-            kernel32.ShowWindow(hwnd, 0)  # SW_HIDE
-            logging.info("Внешняя консоль скрыта (SW_HIDE).")
-            return
-        # Консоль принадлежит нам — пересоздаём процесс без консоли.
-        if getattr(sys, 'frozen', False):
-            script_argv = [sys.executable] + sys.argv[1:]
-        else:
-            script_argv = [sys.executable] + sys.argv
-        _run_detached_pythonw(script_argv)
-        sys.exit(0)
+        env = os.environ.copy()
+        env["VIDEOSQUEEZER_RELAUNCHED"] = "1"
+        pythonw = _find_launcher()
+        if pythonw is not None:
+            # pythonw.exe: процесс вообще не имеет консоли — окно не появится
+            cmdline = " ".join([_quote_arg(pythonw),
+                                _quote_arg(os.path.abspath(__file__))]
+                               + [_quote_arg(a) for a in sys.argv[1:]])
+            if _spawn_hidden(cmdline, env):
+                os._exit(0)  # завершаем старый процесс СРАЗУ, не дожидаясь GUI
+        elif getattr(sys, 'frozen', False):
+            # Windowed-EXE: пересоздаём себя без видимой консоли
+            cmdline = " ".join([_quote_arg(sys.executable)]
+                               + [_quote_arg(a) for a in sys.argv[1:]])
+            if _spawn_hidden(cmdline, env):
+                os._exit(0)
+        # Не удалось перезапуститься (нет pythonw / отказ CreateProcess) —
+        # минимум: скрываем существующее окно консоли и работаем дальше.
+        kernel32.ShowWindow(hwnd, 0)  # SW_HIDE
+        logging.info("Перезапуск без консоли недоступен — консоль скрыта (SW_HIDE).")
     except SystemExit:
         raise
-    except Exception as e:
+    except BaseException as e:
         logging.warning(f"Перезапуск без консоли не удался ({e}), "
                         "продолжаем в текущем процессе.")
 
